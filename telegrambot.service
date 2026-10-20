@@ -1,0 +1,51 @@
+# systemd unit template for the Telegram file-sharing bot.
+#
+# Assumptions:
+#   - The project is installed at /opt/telegrambot
+#   - The virtualenv is /opt/telegrambot/.venv
+#   - The service runs as the "telegrambot" system user
+#   - Configuration is /opt/telegrambot/.env
+#
+# Install:
+#   sudo cp telegrambot.service /etc/systemd/system/telegrambot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telegrambot
+
+[Unit]
+Description=Telegram file-sharing bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telegrambot
+Group=telegrambot
+WorkingDirectory=/opt/telegrambot
+EnvironmentFile=/opt/telegrambot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/telegrambot/.venv/bin/python /opt/telegrambot/bot.py
+
+# Give the bot a chance to close connections and flush SQLite cleanly.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+Restart=on-failure
+RestartSec=5
+
+# Basic hardening. ReadWritePaths must include the data directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/telegrambot/data
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

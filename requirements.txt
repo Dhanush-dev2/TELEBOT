@@ -1,0 +1,8 @@
+# Python 3.11 is recommended (Pyrogram 2.x compatibility).
+pyrogram>=2.0.106,<3.0
+TgCrypto>=1.2.5,<2.0
+APScheduler>=3.10.4,<4.0
+SQLAlchemy>=2.0.30,<3.0
+aiosqlite>=0.20.0,<1.0
+python-dotenv>=1.0.1,<2.0
+aiohttp>=3.9.5,<4.0

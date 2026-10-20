@@ -1,0 +1,12 @@
+services:
+  telebot:
+    build: .
+    container_name: telebot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # The SQLite databases and Pyrogram session live here. Keep this
+      # directory when recreating the container.
+      - ./data:/app/data
+    stop_grace_period: 15s

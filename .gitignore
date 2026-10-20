@@ -1,0 +1,22 @@
+# Secrets and local configuration
+.env
+
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data: SQLite databases, WAL files and Pyrogram sessions
+data/
+*.session
+*.session-journal
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
