@@ -26,7 +26,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/telegrambot/.venv/bin/python /opt/telegrambot/bot.py
 
-# Give the bot a chance to close connections and flush SQLite cleanly.
+# Give the bot a chance to close Telegram, HTTP and Turso connections cleanly.
 KillSignal=SIGINT
 TimeoutStopSec=20
 

@@ -2,8 +2,8 @@
 .env
 
 # Virtual environments
-.venv/
-venv/
+.venv*/
+venv*/
 
 # Python bytecode / caches
 __pycache__/
@@ -12,7 +12,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Runtime data: SQLite databases, WAL files and Pyrogram sessions
+# Runtime data: Pyrogram sessions (all database state is in Turso)
 data/
 *.session
 *.session-journal

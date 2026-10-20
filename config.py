@@ -69,8 +69,9 @@ class Settings:
     force_sub_channel: Optional[ChatRef]
     force_sub_invite_link: Optional[str]
     auto_delete_seconds: int
-    database_path: Path
-    scheduler_db_path: Path
+    turso_database_url: str
+    turso_auth_token: Optional[str]
+    port: int
     data_dir: Path
     session_name: str
     log_level: str
@@ -91,6 +92,25 @@ class Settings:
         vplink_api_key = required("VPLINK_API_KEY")
         bot_username = required("BOT_USERNAME").lstrip("@")
         storage_raw = required("STORAGE_CHANNEL")
+        turso_database_url = required("TURSO_DATABASE_URL")
+        turso_auth_token = _get("TURSO_AUTH_TOKEN")
+
+        if turso_database_url and not turso_database_url.startswith(
+            ("libsql://", "wss://", "ws://", "file:")
+        ):
+            errors.append(
+                "TURSO_DATABASE_URL must be a libsql:// URL from "
+                "'turso db show <db> --url' (wss:// is also accepted). "
+                "Use file:path only for local testing."
+            )
+        if (
+            turso_database_url
+            and not turso_database_url.startswith("file:")
+            and not turso_auth_token
+        ):
+            errors.append(
+                "TURSO_AUTH_TOKEN is required for a remote Turso database"
+            )
 
         api_id = 0
         raw_api_id = required("API_ID")
@@ -133,6 +153,17 @@ class Settings:
                 if auto_delete_seconds <= 0:
                     errors.append("AUTO_DELETE_SECONDS must be greater than zero")
 
+        port = 8080
+        raw_port = _get("PORT", "8080")
+        if raw_port:
+            try:
+                port = int(raw_port)
+            except ValueError:
+                errors.append("PORT must be an integer")
+            else:
+                if not 1 <= port <= 65535:
+                    errors.append("PORT must be between 1 and 65535")
+
         force_sub_channel: Optional[ChatRef] = None
         raw_force_sub = _get("FORCE_SUB_CHANNEL")
         if raw_force_sub:
@@ -169,12 +200,6 @@ class Settings:
             )
 
         data_dir = _resolve_path(_get("DATA_DIR", "data") or "data")
-        database_path = _resolve_path(
-            _get("DATABASE_PATH", "data/bot.db") or "data/bot.db"
-        )
-        scheduler_db_path = _resolve_path(
-            _get("SCHEDULER_DB_PATH", "data/scheduler.db") or "data/scheduler.db"
-        )
         session_name = _get("SESSION_NAME", "telebot") or "telebot"
         if not _SESSION_NAME_RE.fullmatch(session_name):
             errors.append(
@@ -197,8 +222,7 @@ class Settings:
             )
             raise SystemExit(1)
 
-        for directory in {data_dir, database_path.parent, scheduler_db_path.parent}:
-            directory.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
 
         return cls(
             bot_token=bot_token,
@@ -213,8 +237,9 @@ class Settings:
             force_sub_channel=force_sub_channel,
             force_sub_invite_link=force_sub_invite_link,
             auto_delete_seconds=auto_delete_seconds,
-            database_path=database_path,
-            scheduler_db_path=scheduler_db_path,
+            turso_database_url=turso_database_url,
+            turso_auth_token=turso_auth_token,
+            port=port,
             data_dir=data_dir,
             session_name=session_name,
             log_level=log_level,

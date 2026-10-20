@@ -653,7 +653,7 @@ async def _handle_editpost_message(
             button_url=stored.button_url,
         )
     except Exception:
-        logger.exception("Failed to update library post quality in SQLite")
+        logger.exception("Failed to update library post quality in Turso")
         await send_message(
             client,
             message.chat.id,

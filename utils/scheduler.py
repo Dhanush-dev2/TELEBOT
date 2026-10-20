@@ -1,11 +1,10 @@
-"""Persistent auto-delete scheduling with APScheduler.
+"""Auto-delete scheduling with APScheduler.
 
-The scheduler uses an SQLAlchemy-backed SQLite jobstore so jobs survive
-restarts. The ``pending_deletions`` table in the main database is the source of
-truth used to re-register jobs on startup.
-
-IMPORTANT: ``_delete_messages_job`` is persisted by reference in the jobstore.
-Do not rename or move it without migrating/clearing the scheduler database.
+APScheduler runs with an in-memory jobstore because the application itself is
+stateless on Render. Durable state lives in the Turso ``pending_deletions``
+table instead: every job is written there first, and ``reload_pending_jobs()``
+re-registers all still-pending rows on startup. This keeps deletion jobs
+surviving restarts/redeploys without a second database.
 """
 
 from __future__ import annotations
@@ -16,14 +15,13 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 import database
-from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +37,8 @@ def init_scheduler(client: Client) -> AsyncIOScheduler:
     global _scheduler, _client
     _client = client
 
-    jobstores = {
-        "default": SQLAlchemyJobStore(
-            url=f"sqlite:///{settings.scheduler_db_path.as_posix()}",
-            tablename="apscheduler_jobs",
-        )
-    }
     _scheduler = AsyncIOScheduler(
-        jobstores=jobstores,
+        jobstores={"default": MemoryJobStore()},
         timezone=timezone.utc,
         job_defaults={
             "coalesce": True,
@@ -55,7 +47,7 @@ def init_scheduler(client: Client) -> AsyncIOScheduler:
         },
     )
     _scheduler.start()
-    logger.info("APScheduler started (jobstore=%s)", settings.scheduler_db_path)
+    logger.info("APScheduler started (in-memory jobs; Turso is the source of truth)")
     return _scheduler
 
 
@@ -123,11 +115,11 @@ async def schedule_deletion(
 
 
 async def reload_pending_jobs() -> None:
-    """Re-register deletion jobs after a restart.
+    """Rebuild the in-memory schedule from Turso after every startup.
 
-    APScheduler already restores jobs from its own jobstore, but replaying the
-    pending_deletions table repairs jobs lost if the scheduler DB was removed
-    or a job was added while the scheduler was unavailable.
+    ``pending_deletions`` is the durable source of truth. Rows whose delete
+    time already passed are scheduled one second in the future so the bot
+    catches up after a Render restart or deploy.
     """
     rows = await database.get_pending_deletions()
     now = time.time()
@@ -155,11 +147,7 @@ async def _delete_messages_job(
     chat_id: int,
     message_ids: list[int],
 ) -> None:
-    """Delete a delivered file and its warning, then clear the pending row.
-
-    This function is referenced by name from the persistent APScheduler
-    jobstore. Renaming or moving it breaks already-scheduled jobs.
-    """
+    """Delete a delivered file and its warning, then clear the pending row."""
     client = _client
     if client is None:
         logger.error(

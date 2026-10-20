@@ -1,8 +1,9 @@
-"""SQLite persistence for files, users, pending deletions and library posts.
+"""Turso/libSQL persistence for files, users, pending deletions and library posts.
 
-All functions open a short-lived connection. SQLite is configured with WAL and
-a busy timeout so the handler updates and the scheduler jobstore can share the
-data directory without spurious "database is locked" errors.
+Every function uses one shared libSQL client created by :func:`init_db`. The
+client supports remote Turso databases (``libsql://...``) and local ``file:``
+databases for development. Schema creation and multi-statement writes use
+transactions/batches so a partially-created library post cannot be committed.
 """
 
 from __future__ import annotations
@@ -11,7 +12,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 
-import aiosqlite
+import libsql_client
+from libsql_client import Client, Transaction
 from pyrogram.types import User
 
 from config import settings
@@ -83,25 +85,62 @@ CREATE INDEX IF NOT EXISTS idx_library_post_qualities_post_id
     ON library_post_qualities (post_id, position);
 """
 
+_SCHEMA_STATEMENTS = tuple(
+    statement.strip() for statement in _SCHEMA.split(";") if statement.strip()
+)
+
+_client: Optional[Client] = None
+
+
+def _get_client() -> Client:
+    if _client is None:
+        raise RuntimeError("Database is not initialized; call init_db() first")
+    return _client
+
 
 @asynccontextmanager
-async def _connect() -> AsyncIterator[aiosqlite.Connection]:
-    db = await aiosqlite.connect(str(settings.database_path))
-    db.row_factory = aiosqlite.Row
+async def _transaction() -> AsyncIterator[Transaction]:
+    """Run statements atomically and close the libSQL transaction stream."""
+    transaction = _get_client().transaction()
     try:
-        await db.execute("PRAGMA busy_timeout = 5000")
-        yield db
+        yield transaction
+        await transaction.commit()
+    except BaseException:
+        try:
+            await transaction.rollback()
+        except Exception:
+            logger.exception("Failed to roll back Turso transaction")
+        raise
     finally:
-        await db.close()
+        transaction.close()
 
 
 async def init_db() -> None:
-    """Create tables if needed and enable WAL mode."""
-    async with _connect() as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        await db.executescript(_SCHEMA)
-        await db.commit()
-    logger.info("SQLite database ready at %s", settings.database_path)
+    """Create the Turso schema once at startup."""
+    global _client
+    if _client is not None:
+        return
+
+    client = libsql_client.create_client(
+        settings.turso_database_url,
+        auth_token=settings.turso_auth_token,
+    )
+    try:
+        await client.batch(list(_SCHEMA_STATEMENTS))
+    except Exception:
+        await client.close()
+        raise
+
+    _client = client
+    logger.info("Turso/libSQL database ready at %s", settings.turso_database_url)
+
+
+async def close_db() -> None:
+    """Close the shared libSQL client during shutdown."""
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
 
 
 async def add_file(
@@ -112,37 +151,33 @@ async def add_file(
     uploaded_by: Optional[int],
 ) -> None:
     """Store (or refresh) the unique_id -> storage message mapping."""
-    async with _connect() as db:
-        await db.execute(
-            """
-            INSERT INTO files (unique_id, message_id, file_type, file_name, uploaded_by)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(unique_id) DO UPDATE SET
-                message_id  = excluded.message_id,
-                file_type   = excluded.file_type,
-                file_name   = excluded.file_name,
-                uploaded_by = excluded.uploaded_by
-            """,
-            (unique_id, message_id, file_type, file_name, uploaded_by),
-        )
-        await db.commit()
+    await _get_client().execute(
+        """
+        INSERT INTO files (unique_id, message_id, file_type, file_name, uploaded_by)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(unique_id) DO UPDATE SET
+            message_id  = excluded.message_id,
+            file_type   = excluded.file_type,
+            file_name   = excluded.file_name,
+            uploaded_by = excluded.uploaded_by
+        """,
+        (unique_id, message_id, file_type, file_name, uploaded_by),
+    )
 
 
 async def get_file(unique_id: str) -> Optional[dict]:
     """Return the file row for a deep-link ID, or None if it is unknown."""
-    async with _connect() as db:
-        cursor = await db.execute(
-            "SELECT * FROM files WHERE unique_id = ?", (unique_id,)
-        )
-        row = await cursor.fetchone()
-    return dict(row) if row else None
+    result = await _get_client().execute(
+        "SELECT * FROM files WHERE unique_id = ?", (unique_id,)
+    )
+    return result.rows[0].asdict() if result.rows else None
 
 
 async def _scalar(query: str, params: tuple = ()) -> int:
-    async with _connect() as db:
-        cursor = await db.execute(query, params)
-        row = await cursor.fetchone()
-    return int(row[0]) if row else 0
+    result = await _get_client().execute(query, params)
+    if not result.rows:
+        return 0
+    return int(result.rows[0][0] or 0)
 
 
 async def count_files() -> int:
@@ -168,34 +203,32 @@ async def touch_user(user: User, *, started: bool = False) -> None:
     ``started`` increments the /start counter so stats can report unique users
     who actually opened a deep link (or used /start directly).
     """
-    async with _connect() as db:
-        await db.execute(
-            """
-            INSERT INTO users (user_id, username, first_name, last_name, start_count)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username    = excluded.username,
-                first_name  = excluded.first_name,
-                last_name   = excluded.last_name,
-                last_seen   = datetime('now'),
-                start_count = users.start_count + excluded.start_count
-            """,
-            (
-                user.id,
-                user.username,
-                user.first_name,
-                user.last_name,
-                1 if started else 0,
-            ),
-        )
-        await db.commit()
+    await _get_client().execute(
+        """
+        INSERT INTO users (user_id, username, first_name, last_name, start_count)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username    = excluded.username,
+            first_name  = excluded.first_name,
+            last_name   = excluded.last_name,
+            last_seen   = datetime('now'),
+            start_count = users.start_count + excluded.start_count
+        """,
+        (
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+            1 if started else 0,
+        ),
+    )
 
 
 async def get_all_user_ids() -> list[int]:
-    async with _connect() as db:
-        cursor = await db.execute("SELECT user_id FROM users ORDER BY user_id")
-        rows = await cursor.fetchall()
-    return [int(row["user_id"]) for row in rows]
+    result = await _get_client().execute(
+        "SELECT user_id FROM users ORDER BY user_id"
+    )
+    return [int(row["user_id"]) for row in result.rows]
 
 
 async def add_pending_deletion(
@@ -205,39 +238,35 @@ async def add_pending_deletion(
     delete_at: float,
 ) -> int:
     """Persist a deletion so it can be rescheduled after a restart."""
-    async with _connect() as db:
-        cursor = await db.execute(
-            """
-            INSERT INTO pending_deletions
-                (chat_id, file_message_id, warning_message_id, delete_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (chat_id, file_message_id, warning_message_id, delete_at),
-        )
-        await db.commit()
-        row_id = cursor.lastrowid
-    if row_id is None:  # pragma: no cover - sqlite always returns a rowid here
-        raise RuntimeError("SQLite did not return an id for the pending deletion")
-    return int(row_id)
+    result = await _get_client().execute(
+        """
+        INSERT INTO pending_deletions
+            (chat_id, file_message_id, warning_message_id, delete_at)
+        VALUES (?, ?, ?, ?)
+        RETURNING id
+        """,
+        (chat_id, file_message_id, warning_message_id, delete_at),
+    )
+    if not result.rows:
+        raise RuntimeError("Turso did not return an id for the pending deletion")
+    return int(result.rows[0]["id"])
 
 
 async def get_pending_deletions() -> list[dict]:
-    async with _connect() as db:
-        cursor = await db.execute(
-            """
-            SELECT id, chat_id, file_message_id, warning_message_id, delete_at
-            FROM pending_deletions
-            ORDER BY delete_at
-            """
-        )
-        rows = await cursor.fetchall()
-    return [dict(row) for row in rows]
+    result = await _get_client().execute(
+        """
+        SELECT id, chat_id, file_message_id, warning_message_id, delete_at
+        FROM pending_deletions
+        ORDER BY delete_at
+        """
+    )
+    return [row.asdict() for row in result.rows]
 
 
 async def delete_pending_deletion(row_id: int) -> None:
-    async with _connect() as db:
-        await db.execute("DELETE FROM pending_deletions WHERE id = ?", (row_id,))
-        await db.commit()
+    await _get_client().execute(
+        "DELETE FROM pending_deletions WHERE id = ?", (row_id,)
+    )
 
 
 async def add_library_post(
@@ -253,14 +282,15 @@ async def add_library_post(
     qualities: list[dict],
 ) -> int:
     """Insert a library post and its quality buttons in one transaction."""
-    async with _connect() as db:
-        cursor = await db.execute(
+    async with _transaction() as transaction:
+        result = await transaction.execute(
             """
             INSERT INTO library_posts
                 (title, thumbnail_file_id, links_channel_id, links_message_id,
                  links_message_link, library_channel_id, library_message_id,
                  library_message_link)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
             """,
             (
                 title,
@@ -273,18 +303,18 @@ async def add_library_post(
                 library_message_link,
             ),
         )
-        post_id = cursor.lastrowid
-        if post_id is None:  # pragma: no cover - sqlite always returns a rowid
-            raise RuntimeError("SQLite did not return an id for the library post")
+        if not result.rows:
+            raise RuntimeError("Turso did not return an id for the library post")
+        post_id = int(result.rows[0]["id"])
 
-        await db.executemany(
-            """
-            INSERT INTO library_post_qualities
-                (post_id, label, unique_id, storage_message_id, direct_link,
-                 short_link, button_url, position)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+        for position, quality in enumerate(qualities):
+            await transaction.execute(
+                """
+                INSERT INTO library_post_qualities
+                    (post_id, label, unique_id, storage_message_id, direct_link,
+                     short_link, button_url, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     post_id,
                     quality["label"],
@@ -294,36 +324,31 @@ async def add_library_post(
                     quality.get("short_link"),
                     quality["button_url"],
                     position,
-                )
-                for position, quality in enumerate(qualities)
-            ],
-        )
-        await db.commit()
+                ),
+            )
 
     return int(post_id)
 
 
 async def get_library_post(post_id: int) -> Optional[dict]:
     """Return a library post with its qualities, or None if it is unknown."""
-    async with _connect() as db:
-        cursor = await db.execute(
-            "SELECT * FROM library_posts WHERE id = ?", (post_id,)
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        quality_cursor = await db.execute(
-            """
-            SELECT * FROM library_post_qualities
-            WHERE post_id = ?
-            ORDER BY position, id
-            """,
-            (post_id,),
-        )
-        quality_rows = await quality_cursor.fetchall()
+    result = await _get_client().execute(
+        "SELECT * FROM library_posts WHERE id = ?", (post_id,)
+    )
+    if not result.rows:
+        return None
 
-    post = dict(row)
-    post["qualities"] = [dict(quality) for quality in quality_rows]
+    quality_result = await _get_client().execute(
+        """
+        SELECT * FROM library_post_qualities
+        WHERE post_id = ?
+        ORDER BY position, id
+        """,
+        (post_id,),
+    )
+
+    post = result.rows[0].asdict()
+    post["qualities"] = [row.asdict() for row in quality_result.rows]
     return post
 
 
@@ -338,8 +363,8 @@ async def replace_library_post_quality(
     button_url: str,
 ) -> bool:
     """Replace one quality's stored file/link metadata."""
-    async with _connect() as db:
-        cursor = await db.execute(
+    async with _transaction() as transaction:
+        result = await transaction.execute(
             """
             UPDATE library_post_qualities
             SET unique_id = ?,
@@ -360,13 +385,12 @@ async def replace_library_post_quality(
                 label,
             ),
         )
-        if cursor.rowcount == 0:
+        if result.rows_affected == 0:
             return False
 
-        await db.execute(
+        await transaction.execute(
             "UPDATE library_posts SET updated_at = datetime('now') WHERE id = ?",
             (post_id,),
         )
-        await db.commit()
 
     return True

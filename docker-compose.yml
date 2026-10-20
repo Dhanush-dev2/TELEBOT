@@ -5,8 +5,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      # Keep-alive HTTP server.
+      - "${PORT:-8080}:${PORT:-8080}"
     volumes:
-      # The SQLite databases and Pyrogram session live here. Keep this
-      # directory when recreating the container.
+      # All persistent data is in Turso; this volume only stores the
+      # disposable Pyrogram session.
       - ./data:/app/data
     stop_grace_period: 15s
