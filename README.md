@@ -180,6 +180,11 @@ TURSO_DATABASE_URL=libsql://your-database-your-org.turso.io
 TURSO_AUTH_TOKEN=eyJ...
 ```
 
+The bot normalizes the `libsql://` URL to `https://` internally and uses
+Turso's HTTP pipeline API. Current Turso endpoints reject Hrana WebSocket
+upgrades, so the WebSocket transport in older libSQL clients does not work
+against them. An `https://` URL is also accepted.
+
 The bot creates all tables automatically on its first successful startup.
 Verify the connection (before or after the first run):
 
@@ -208,7 +213,7 @@ sqlite3 data/bot.db .dump | turso db shell telebot
 
 **Local-only test database:** for development without a Turso account, set
 `TURSO_DATABASE_URL=file:data/dev.db` and leave `TURSO_AUTH_TOKEN` empty. This
-is not durable on Render; use a real `libsql://` URL in production.
+is not durable on Render; use a real `libsql://` or `https://` URL in production.
 
 ### 3.3 Scheduler persistence
 
@@ -256,7 +261,7 @@ prints a list of problems and exits before connecting to Telegram.
 | `LIBRARY_CHANNEL` | no* | — | Public-facing channel linking to the links post |
 | `ADMIN_IDS` | yes | — | Comma-separated numeric user IDs |
 | `VPLINK_API_KEY` | yes | — | VPLink API key |
-| `TURSO_DATABASE_URL` | yes | — | `libsql://...` URL from `turso db show` |
+| `TURSO_DATABASE_URL` | yes | — | `libsql://...` URL from `turso db show` (or `https://...`) |
 | `TURSO_AUTH_TOKEN` | yes* | — | Token from `turso db tokens create` |
 | `FORCE_SUB_CHANNEL` | no | — | Channel gate; empty disables it |
 | `FORCE_SUB_INVITE_LINK` | no | — | Invite link for private gate |
@@ -268,8 +273,8 @@ prints a list of problems and exits before connecting to Telegram.
 
 `*` `LINKS_CHANNEL` and `LIBRARY_CHANNEL` are optional for normal file
 delivery, but both are required for `/newpost` and `/editpost`.
-`TURSO_AUTH_TOKEN` is required for remote `libsql://` URLs; it can be empty
-only when using a local `file:` test database.
+`TURSO_AUTH_TOKEN` is required for remote `libsql://` and `https://` URLs; it
+can be empty only when using a local `file:` test database.
 
 Relative paths are resolved against the repository root, not the current
 working directory. There is no local database file: all bot data is in Turso.
@@ -666,8 +671,9 @@ telebot/
 
 **Turso configuration or connection errors**
 
-- `TURSO_DATABASE_URL` must start with `libsql://` and come from
-  `turso db show <db> --url`; an `https://` URL is not accepted by this client.
+- `TURSO_DATABASE_URL` should come from `turso db show <db> --url`
+  (`libsql://...`). An `https://...` URL is also accepted. The bot converts
+  either form to the HTTPS HTTP API internally.
 - `TURSO_AUTH_TOKEN` must come from
   `turso db tokens create <db> --expiration never`. Do not wrap it in quotes in
   Render's environment settings.

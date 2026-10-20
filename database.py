@@ -3,17 +3,20 @@
 Every function uses one shared libSQL client created by :func:`init_db`. The
 client supports remote Turso databases (``libsql://...``) and local ``file:``
 databases for development. Schema creation and multi-statement writes use
-transactions/batches so a partially-created library post cannot be committed.
+atomic HTTP batches so a partially-created library post cannot be committed.
+
+Turso's current database endpoints do not accept Hrana WebSocket upgrades, so
+remote URLs are normalized to HTTPS and libsql-client's HTTP transport is used.
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 import libsql_client
-from libsql_client import Client, Transaction
+from libsql_client import Client
 from pyrogram.types import User
 
 from config import settings
@@ -98,21 +101,27 @@ def _get_client() -> Client:
     return _client
 
 
-@asynccontextmanager
-async def _transaction() -> AsyncIterator[Transaction]:
-    """Run statements atomically and close the libSQL transaction stream."""
-    transaction = _get_client().transaction()
-    try:
-        yield transaction
-        await transaction.commit()
-    except BaseException:
-        try:
-            await transaction.rollback()
-        except Exception:
-            logger.exception("Failed to roll back Turso transaction")
-        raise
-    finally:
-        transaction.close()
+def _http_url(url: str) -> str:
+    """Return the HTTPS/HTTP form used by libsql-client's HTTP transport.
+
+    Turso's ``libsql://`` URL is the WebSocket endpoint. Current Turso
+    endpoints reject the WebSocket upgrade, while the same host serves the
+    HTTP pipeline API over ``https://``. A ``file:`` URL is left untouched for
+    local development. Query strings are dropped because the auth token is
+    passed separately to ``create_client``.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "file":
+        return url
+
+    scheme = {
+        "libsql": "https",
+        "wss": "https",
+        "https": "https",
+        "ws": "http",
+        "http": "http",
+    }.get(parsed.scheme, parsed.scheme)
+    return urlunparse((scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
 async def init_db() -> None:
@@ -122,7 +131,7 @@ async def init_db() -> None:
         return
 
     client = libsql_client.create_client(
-        settings.turso_database_url,
+        _http_url(settings.turso_database_url),
         auth_token=settings.turso_auth_token,
     )
     try:
@@ -132,7 +141,10 @@ async def init_db() -> None:
         raise
 
     _client = client
-    logger.info("Turso/libSQL database ready at %s", settings.turso_database_url)
+    logger.info(
+        "Turso/libSQL database ready via HTTP at %s",
+        _http_url(settings.turso_database_url),
+    )
 
 
 async def close_db() -> None:
@@ -281,9 +293,9 @@ async def add_library_post(
     library_message_link: Optional[str],
     qualities: list[dict],
 ) -> int:
-    """Insert a library post and its quality buttons in one transaction."""
-    async with _transaction() as transaction:
-        result = await transaction.execute(
+    """Insert a library post and its quality buttons in one atomic batch."""
+    statements: list[tuple[str, tuple]] = [
+        (
             """
             INSERT INTO library_posts
                 (title, thumbnail_file_id, links_channel_id, links_message_id,
@@ -303,20 +315,24 @@ async def add_library_post(
                 library_message_link,
             ),
         )
-        if not result.rows:
-            raise RuntimeError("Turso did not return an id for the library post")
-        post_id = int(result.rows[0]["id"])
+    ]
 
-        for position, quality in enumerate(qualities):
-            await transaction.execute(
+    for position, quality in enumerate(qualities):
+        # The HTTP batch is one atomic transaction on Turso. The post has just
+        # been inserted, so the highest id in library_posts is this post; no
+        # other writer can insert between batch statements.
+        statements.append(
+            (
                 """
                 INSERT INTO library_post_qualities
                     (post_id, label, unique_id, storage_message_id, direct_link,
                      short_link, button_url, position)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (
+                    (SELECT id FROM library_posts ORDER BY id DESC LIMIT 1),
+                    ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
-                    post_id,
                     quality["label"],
                     quality["unique_id"],
                     quality["storage_message_id"],
@@ -326,8 +342,12 @@ async def add_library_post(
                     position,
                 ),
             )
+        )
 
-    return int(post_id)
+    results = await _get_client().batch(statements)
+    if not results or not results[0].rows:
+        raise RuntimeError("Turso did not return an id for the library post")
+    return int(results[0].rows[0]["id"])
 
 
 async def get_library_post(post_id: int) -> Optional[dict]:
@@ -363,34 +383,42 @@ async def replace_library_post_quality(
     button_url: str,
 ) -> bool:
     """Replace one quality's stored file/link metadata."""
-    async with _transaction() as transaction:
-        result = await transaction.execute(
-            """
-            UPDATE library_post_qualities
-            SET unique_id = ?,
-                storage_message_id = ?,
-                direct_link = ?,
-                short_link = ?,
-                button_url = ?,
-                updated_at = datetime('now')
-            WHERE post_id = ? AND label = ?
-            """,
+    results = await _get_client().batch(
+        [
             (
-                unique_id,
-                storage_message_id,
-                direct_link,
-                short_link,
-                button_url,
-                post_id,
-                label,
+                """
+                UPDATE library_post_qualities
+                SET unique_id = ?,
+                    storage_message_id = ?,
+                    direct_link = ?,
+                    short_link = ?,
+                    button_url = ?,
+                    updated_at = datetime('now')
+                WHERE post_id = ? AND label = ?
+                """,
+                (
+                    unique_id,
+                    storage_message_id,
+                    direct_link,
+                    short_link,
+                    button_url,
+                    post_id,
+                    label,
+                ),
             ),
-        )
-        if result.rows_affected == 0:
-            return False
+            (
+                """
+                UPDATE library_posts
+                SET updated_at = datetime('now')
+                WHERE id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM library_post_qualities
+                      WHERE post_id = ? AND label = ?
+                  )
+                """,
+                (post_id, post_id, label),
+            ),
+        ]
+    )
 
-        await transaction.execute(
-            "UPDATE library_posts SET updated_at = datetime('now') WHERE id = ?",
-            (post_id,),
-        )
-
-    return True
+    return bool(results and results[0].rows_affected)

@@ -96,12 +96,11 @@ class Settings:
         turso_auth_token = _get("TURSO_AUTH_TOKEN")
 
         if turso_database_url and not turso_database_url.startswith(
-            ("libsql://", "wss://", "ws://", "file:")
+            ("libsql://", "wss://", "ws://", "https://", "file:")
         ):
             errors.append(
-                "TURSO_DATABASE_URL must be a libsql:// URL from "
-                "'turso db show <db> --url' (wss:// is also accepted). "
-                "Use file:path only for local testing."
+                "TURSO_DATABASE_URL must be a libsql:// or https:// URL from "
+                "'turso db show <db> --url'. Use file:path only for local testing."
             )
         if (
             turso_database_url

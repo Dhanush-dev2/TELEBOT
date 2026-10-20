@@ -18,12 +18,12 @@ Full setup, deployment and troubleshooting steps are in `README.md`.
 
 ## Architecture notes
 
-- `config.py` validates the environment on import and builds the immutable `settings` object. Relative paths resolve from the repo root, not the CWD. Don't read env vars elsewhere. `TURSO_DATABASE_URL` is required; `TURSO_AUTH_TOKEN` is required for remote `libsql://` URLs (only `file:` test databases may omit it). `PORT` defaults to 8080 and Render injects it.
+- `config.py` validates the environment on import and builds the immutable `settings` object. Relative paths resolve from the repo root, not the CWD. Don't read env vars elsewhere. `TURSO_DATABASE_URL` is required; `libsql://`, `wss://`, and `https://` remote forms are accepted, and `TURSO_AUTH_TOKEN` is required for all of them (only `file:` test databases may omit it). `PORT` defaults to 8080 and Render injects it.
 - Handlers are registered explicitly in `bot.py` through `admin.register(app)`, `library.register(app)` / `user.register(app)`; the code does not use `@Client.on_message` decorators. Add new handlers in those `register()` functions.
 - `/newpost` and `/editpost` keep per-admin drafts in memory (`handlers/library.py`); created post metadata lives in `library_posts` / `library_post_qualities`.
 - `utils/pyrogram_compat.py` widens Pyrogram's peer-ID bounds for new `-100...` channels. It must be imported before handlers that call channel APIs (`bot.py` and `utils/channels.py` do this).
 - Deep-link IDs are `base62(storage_message_id)` (`utils/encoding.py`) stored as `files.unique_id`. Changing the encoding breaks every existing link. They are short but guessable by design.
-- Turso/libSQL is the only durable store (`database.py`, one shared `libsql-client` created by `init_db()`). Tables are created idempotently at startup. There is no local database file; `data/` holds only the disposable Pyrogram session.
+- Turso/libSQL is the only durable store (`database.py`, one shared `libsql-client` created by `init_db()`). Remote URLs are normalized to HTTPS because current Turso endpoints reject Hrana WebSocket upgrades; multi-statement writes use atomic HTTP batches. Tables are created idempotently at startup. There is no local database file; `data/` holds only the disposable Pyrogram session.
 - APScheduler uses `MemoryJobStore`; `pending_deletions` in Turso is the source of truth. `reload_pending_jobs()` re-registers every unfinished row on startup, including expired ones. Do not reintroduce a local SQLAlchemy jobstore or `data/scheduler.db`.
 - `utils/http_server.py` runs an aiohttp keep-alive server on `0.0.0.0:$PORT`; `GET /` returns `OK`. It starts before Turso/Telegram startup so Render sees an open port.
 - Telegram sends go through `utils/telegram.py` for FloodWait retries; keep new bulk sends on those wrappers.
