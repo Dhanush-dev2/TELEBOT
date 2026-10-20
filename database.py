@@ -57,6 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_deletions_delete_at
 CREATE TABLE IF NOT EXISTS library_posts (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     title               TEXT NOT NULL,
+    category            TEXT NOT NULL DEFAULT 'default',
     thumbnail_file_id   TEXT NOT NULL,
     links_channel_id    INTEGER NOT NULL,
     links_message_id    INTEGER NOT NULL,
@@ -124,6 +125,26 @@ def _http_url(url: str) -> str:
     return urlunparse((scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
+async def _migrate_library_posts_category(client: Client) -> None:
+    """Add the category column to databases created before multi-category posts."""
+    result = await client.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM pragma_table_info('library_posts')
+        WHERE name = 'category'
+        """
+    )
+    has_category = bool(result.rows and int(result.rows[0][0]))
+    if has_category:
+        return
+
+    logger.info("Adding missing category column to library_posts")
+    await client.execute(
+        "ALTER TABLE library_posts "
+        "ADD COLUMN category TEXT NOT NULL DEFAULT 'default'"
+    )
+
+
 async def init_db() -> None:
     """Create the Turso schema once at startup."""
     global _client
@@ -136,6 +157,7 @@ async def init_db() -> None:
     )
     try:
         await client.batch(list(_SCHEMA_STATEMENTS))
+        await _migrate_library_posts_category(client)
     except Exception:
         await client.close()
         raise
@@ -284,6 +306,7 @@ async def delete_pending_deletion(row_id: int) -> None:
 async def add_library_post(
     *,
     title: str,
+    category: str = "default",
     thumbnail_file_id: str,
     links_channel_id: int,
     links_message_id: int,
@@ -298,14 +321,15 @@ async def add_library_post(
         (
             """
             INSERT INTO library_posts
-                (title, thumbnail_file_id, links_channel_id, links_message_id,
-                 links_message_link, library_channel_id, library_message_id,
-                 library_message_link)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (title, category, thumbnail_file_id, links_channel_id,
+                 links_message_id, links_message_link, library_channel_id,
+                 library_message_id, library_message_link)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (
                 title,
+                category,
                 thumbnail_file_id,
                 links_channel_id,
                 links_message_id,
@@ -351,7 +375,7 @@ async def add_library_post(
 
 
 async def get_library_post(post_id: int) -> Optional[dict]:
-    """Return a library post with its qualities, or None if it is unknown."""
+    """Return a library post (including its category) with its qualities."""
     result = await _get_client().execute(
         "SELECT * FROM library_posts WHERE id = ?", (post_id,)
     )
@@ -370,6 +394,36 @@ async def get_library_post(post_id: int) -> Optional[dict]:
     post = result.rows[0].asdict()
     post["qualities"] = [row.asdict() for row in quality_result.rows]
     return post
+
+
+async def update_library_post_location(
+    post_id: int,
+    *,
+    category: str,
+    library_channel_id: int,
+    library_message_id: int,
+    library_message_link: Optional[str],
+) -> bool:
+    """Point a post at a new category/channel message after a repost."""
+    result = await _get_client().execute(
+        """
+        UPDATE library_posts
+        SET category = ?,
+            library_channel_id = ?,
+            library_message_id = ?,
+            library_message_link = ?,
+            updated_at = datetime('now')
+        WHERE id = ?
+        """,
+        (
+            category,
+            library_channel_id,
+            library_message_id,
+            library_message_link,
+            post_id,
+        ),
+    )
+    return bool(result.rows_affected)
 
 
 async def replace_library_post_quality(

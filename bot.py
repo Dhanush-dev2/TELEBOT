@@ -4,7 +4,8 @@ Startup order matters:
 1. Validate configuration (config.py does this on import).
 2. Start the keep-alive HTTP server so Render sees an open port.
 3. Create the Turso/libSQL schema.
-4. Start Pyrogram and verify access to the storage/force-sub channels.
+4. Start Pyrogram and verify access to the storage/force-sub channels and
+   every configured library category.
 5. Start APScheduler and re-register pending auto-delete jobs from Turso.
 6. Register handlers and idle until stopped.
 """
@@ -22,7 +23,11 @@ from config import settings
 from utils import pyrogram_compat  # noqa: F401 - must run before handlers
 from handlers import admin, library, user
 from utils import http_server, scheduler
-from utils.channels import require_channel_admin, resolve_channel
+from utils.channels import (
+    require_channel_admin,
+    resolve_channel,
+    validate_library_channels,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,10 @@ async def _validate_channels(app: Client) -> None:
             force_chat.title or force_chat.username,
             force_chat.id,
         )
+
+    # Log one clear line per category instead of failing the whole startup when
+    # one library channel is temporarily unavailable.
+    await validate_library_channels(app, settings.library_channels)
 
 
 async def main() -> None:

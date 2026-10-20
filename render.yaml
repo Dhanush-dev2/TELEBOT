@@ -37,7 +37,11 @@ services:
         sync: false
 
       # Optional: required only for /newpost and /editpost.
+      # LIBRARY_CHANNELS is category:@channel,category2:@channel2.
+      # LIBRARY_CHANNEL is the legacy single-channel fallback.
       - key: LINKS_CHANNEL
+        sync: false
+      - key: LIBRARY_CHANNELS
         sync: false
       - key: LIBRARY_CHANNEL
         sync: false

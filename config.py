@@ -16,6 +16,8 @@ from typing import Optional, Union
 
 from dotenv import load_dotenv
 
+from utils.categories import parse_chat_ref, parse_library_channels
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
@@ -39,14 +41,6 @@ def _get(name: str, default: Optional[str] = None) -> Optional[str]:
     return raw or default
 
 
-def _parse_chat_ref(value: str) -> ChatRef:
-    """Return an int for numeric chat IDs (-100...) and a string otherwise."""
-    raw = value.strip()
-    if raw.lstrip("-").isdigit():
-        return int(raw)
-    return raw
-
-
 def _resolve_path(value: str) -> Path:
     """Resolve relative paths against the repository root, not the CWD."""
     path = Path(value).expanduser()
@@ -62,7 +56,7 @@ class Settings:
     api_hash: str
     storage_channel: ChatRef
     links_channel: Optional[ChatRef]
-    library_channel: Optional[ChatRef]
+    library_channels: dict[str, ChatRef]
     admin_ids: tuple[int, ...]
     vplink_api_key: str
     bot_username: str
@@ -166,17 +160,17 @@ class Settings:
         force_sub_channel: Optional[ChatRef] = None
         raw_force_sub = _get("FORCE_SUB_CHANNEL")
         if raw_force_sub:
-            force_sub_channel = _parse_chat_ref(raw_force_sub)
+            force_sub_channel = parse_chat_ref(raw_force_sub)
 
         links_channel: Optional[ChatRef] = None
         raw_links = _get("LINKS_CHANNEL")
         if raw_links:
-            links_channel = _parse_chat_ref(raw_links)
+            links_channel = parse_chat_ref(raw_links)
 
-        library_channel: Optional[ChatRef] = None
-        raw_library = _get("LIBRARY_CHANNEL")
-        if raw_library:
-            library_channel = _parse_chat_ref(raw_library)
+        library_channels, library_channel_errors = parse_library_channels(
+            _get("LIBRARY_CHANNELS"), _get("LIBRARY_CHANNEL")
+        )
+        errors.extend(library_channel_errors)
 
         force_sub_invite_link = _get("FORCE_SUB_INVITE_LINK")
         if force_sub_invite_link and not force_sub_invite_link.startswith(
@@ -207,7 +201,7 @@ class Settings:
             )
 
         storage_channel: ChatRef = (
-            _parse_chat_ref(storage_raw) if storage_raw else ""
+            parse_chat_ref(storage_raw) if storage_raw else ""
         )
 
         if errors:
@@ -229,7 +223,7 @@ class Settings:
             api_hash=api_hash,
             storage_channel=storage_channel,
             links_channel=links_channel,
-            library_channel=library_channel,
+            library_channels=library_channels,
             admin_ids=admin_ids,
             vplink_api_key=vplink_api_key,
             bot_username=bot_username,

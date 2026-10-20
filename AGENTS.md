@@ -10,17 +10,18 @@ python -m venv .venv
 pip install -r requirements.txt
 cp .env.example .env      # config.py exits with a list of problems if invalid
 python bot.py
-python -m compileall -q bot.py config.py database.py handlers utils   # only automated check
+python -m compileall -q bot.py config.py database.py handlers utils tests
+python -m unittest discover -s tests -v
 ```
 
-No test suite. Docker: `docker compose up -d --build`, then `docker compose logs -f`.
+Docker: `docker compose up -d --build`, then `docker compose logs -f`.
 Full setup, deployment and troubleshooting steps are in `README.md`.
 
 ## Architecture notes
 
 - `config.py` validates the environment on import and builds the immutable `settings` object. Relative paths resolve from the repo root, not the CWD. Don't read env vars elsewhere. `TURSO_DATABASE_URL` is required; `libsql://`, `wss://`, and `https://` remote forms are accepted, and `TURSO_AUTH_TOKEN` is required for all of them (only `file:` test databases may omit it). `PORT` defaults to 8080 and Render injects it.
 - Handlers are registered explicitly in `bot.py` through `admin.register(app)`, `library.register(app)` / `user.register(app)`; the code does not use `@Client.on_message` decorators. Add new handlers in those `register()` functions.
-- `/newpost` and `/editpost` keep per-admin drafts in memory (`handlers/library.py`); created post metadata lives in `library_posts` / `library_post_qualities`.
+- `/newpost` and `/editpost` keep per-admin drafts in memory (`handlers/library.py`); created post metadata, including the category, lives in `library_posts` / `library_post_qualities`. `LIBRARY_CHANNELS` is parsed by `utils/categories.py` into `settings.library_channels`; startup validates each category independently in `bot.py` through `utils/channels.py`. The legacy `LIBRARY_CHANNEL` becomes category `default`.
 - `utils/pyrogram_compat.py` widens Pyrogram's peer-ID bounds for new `-100...` channels. It must be imported before handlers that call channel APIs (`bot.py` and `utils/channels.py` do this).
 - Deep-link IDs are `base62(storage_message_id)` (`utils/encoding.py`) stored as `files.unique_id`. Changing the encoding breaks every existing link. They are short but guessable by design.
 - Turso/libSQL is the only durable store (`database.py`, one shared `libsql-client` created by `init_db()`). Remote URLs are normalized to HTTPS because current Turso endpoints reject Hrana WebSocket upgrades; multi-statement writes use atomic HTTP batches. Tables are created idempotently at startup. There is no local database file; `data/` holds only the disposable Pyrogram session.

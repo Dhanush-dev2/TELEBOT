@@ -12,9 +12,10 @@ in a private channel and gives users self-destructing download links.
 - Delivered file + warning are deleted after `AUTO_DELETE_SECONDS` (default
   600 = 10 minutes). Pending deletions survive restarts.
 - Library posts: `/newpost` creates a thumbnail/caption post with one download
-  button per quality in `LINKS_CHANNEL`, then links it from `LIBRARY_CHANNEL`.
-- `/editpost <post_id>` replaces one quality file and updates the existing
-  button without recreating the post.
+  button per quality in the shared `LINKS_CHANNEL`, then links it from the
+  selected category channel in `LIBRARY_CHANNELS`.
+- `/editpost <post_id>` replaces one quality file, or moves the library post to
+  another category channel, without recreating the links post.
 - Turso (libSQL) stores files, users, pending deletions and library-post
   metadata, so data survives Render restarts and redeploys.
 - A built-in aiohttp server answers `GET /` with `OK` on Render's `PORT` so an
@@ -31,8 +32,8 @@ in a private channel and gives users self-destructing download links.
 - Telegram API ID / API hash
 - A private storage channel where the bot is an administrator
 - Optional: a force-subscribe channel where the bot is an administrator
-- Optional: `LINKS_CHANNEL` and `LIBRARY_CHANNEL` where the bot is an
-  administrator (required for `/newpost` and `/editpost`)
+- Optional: `LINKS_CHANNEL` and one or more `LIBRARY_CHANNELS` where the bot is
+  an administrator (required for `/newpost` and `/editpost`)
 - A VPLink API key
 - A Turso account and database (free tier is enough; see section 3)
 
@@ -81,25 +82,55 @@ messages in the storage channel.
    export a link itself, which can fail depending on permissions.
 5. Leave `FORCE_SUB_CHANNEL` empty to disable the gate.
 
-### 2.5 Links and library channels
+### 2.5 Links and category library channels
 
-These two channels are used by `/newpost`:
+`/newpost` uses one shared links channel plus any number of category-specific
+library channels:
 
 - `LINKS_CHANNEL` receives the thumbnail + caption with one download button
-  per quality (for example `🔗 1080p`, `🔗 720p`).
-- `LIBRARY_CHANNEL` is the public-facing channel. It receives the same
-  thumbnail + caption with a single **📥 Download Links** button pointing to
-  the `LINKS_CHANNEL` post.
+  per quality (for example `🔗 1080p`, `🔗 720p`). It is shared by all
+  categories.
+- `LIBRARY_CHANNELS` is a comma-separated map of category names to
+  public-facing channels. Each category receives the same thumbnail + caption
+  with a single **📥 Download Links** button pointing to the shared
+  `LINKS_CHANNEL` post. The category name is shown as the button label in
+  `/newpost`.
 
-1. Create or choose both channels.
-2. Add the bot as an **administrator** in both channels with permission to
-   **Post Messages**. Keep these rights if you want to use `/editpost` later.
-3. Set the variables:
-   - Public channel: `LINKS_CHANNEL=@your_links_channel`
-   - Private channel: `LINKS_CHANNEL=-100...`
-   - `LIBRARY_CHANNEL=@your_library_channel` (or a numeric `-100...` ID)
-4. Both values are optional at startup, but `/newpost` and `/editpost` show a
-   clear error until they are configured and the bot is an administrator.
+Format:
+
+```dotenv
+LINKS_CHANNEL=@your_links_channel
+LIBRARY_CHANNELS=anime:@animelibrary_now,tamil:@tamilmovies_library,hollywood:@hollywoodlibraryhub
+```
+
+- Category names must be unique (case-insensitive), single-line, at most 64
+  characters, and must not contain commas or colons.
+- Each channel can be a public `@username` or a numeric `-100...` ID.
+- If `LIBRARY_CHANNELS` is empty and the old `LIBRARY_CHANNEL` variable is set,
+  the bot treats it as one category named `default`. If both are set,
+  `LIBRARY_CHANNELS` wins.
+- Category channels are validated independently at startup. A broken category
+  is logged with its category name but does not prevent other categories or
+  the rest of the bot from starting. Selecting that category later shows a
+  clear category-specific error.
+
+Setup steps:
+
+1. Create the shared `LINKS_CHANNEL` and every category library channel.
+2. Add the bot as an **administrator** in all of them with permission to
+   **Post Messages**. Keep these rights for `/editpost`.
+3. Set `LINKS_CHANNEL` and `LIBRARY_CHANNELS` as shown above.
+4. **Cache each new channel's peer before first use:** forward a **text** test
+   post (not a media file) from the channel to the bot's private DM, wait until
+   the bot receives it, then delete the test message. This is especially
+   important for numeric `-100...` IDs; Pyrogram needs the channel's access
+   hash before it can post. Repeat this once for every new category channel.
+
+`/editpost` uses the stored category to find the existing library message. The
+category buttons in the edit session can move the post: the bot reposts it in
+the new category channel, deletes the old library message, and updates the
+database reference. Quality replacements only edit the shared
+`LINKS_CHANNEL` message, because its buttons are what change.
 
 Private `LINKS_CHANNEL` posts use Telegram's `https://t.me/c/...` link format;
 public channels use `https://t.me/<username>/<message_id>`.
@@ -257,8 +288,9 @@ prints a list of problems and exits before connecting to Telegram.
 | `API_HASH` | yes | — | API hash from my.telegram.org |
 | `BOT_USERNAME` | yes | — | Bot username without `@` |
 | `STORAGE_CHANNEL` | yes | — | `-100...` or `@username` |
-| `LINKS_CHANNEL` | no* | — | Channel for per-quality download buttons |
-| `LIBRARY_CHANNEL` | no* | — | Public-facing channel linking to the links post |
+| `LINKS_CHANNEL` | no* | — | Shared channel for per-quality download buttons |
+| `LIBRARY_CHANNELS` | no* | — | `category:@channel,...` map of library channels |
+| `LIBRARY_CHANNEL` | no* | — | Legacy single channel; used as `default` when `LIBRARY_CHANNELS` is empty |
 | `ADMIN_IDS` | yes | — | Comma-separated numeric user IDs |
 | `VPLINK_API_KEY` | yes | — | VPLink API key |
 | `TURSO_DATABASE_URL` | yes | — | `libsql://...` URL from `turso db show` (or `https://...`) |
@@ -271,8 +303,9 @@ prints a list of problems and exits before connecting to Telegram.
 | `SESSION_NAME` | no | `telebot` | Pyrogram session filename |
 | `LOG_LEVEL` | no | `INFO` | Logging verbosity |
 
-`*` `LINKS_CHANNEL` and `LIBRARY_CHANNEL` are optional for normal file
-delivery, but both are required for `/newpost` and `/editpost`.
+`*` `LINKS_CHANNEL` and at least one library category (`LIBRARY_CHANNELS`, or
+the legacy `LIBRARY_CHANNEL`) are optional for normal file delivery, but are
+required for `/newpost` and `/editpost`.
 `TURSO_AUTH_TOKEN` is required for remote `libsql://` and `https://` URLs; it
 can be empty only when using a local `file:` test database.
 
@@ -339,17 +372,22 @@ PowerShell equivalent: `Invoke-WebRequest http://127.0.0.1:8080/`.
 5. Confirm the file and warning arrive, then verify they disappear after
    `AUTO_DELETE_SECONDS` (use `AUTO_DELETE_SECONDS=60` while testing).
 6. Run `/stats` and reply to a message with `/broadcast` to test admin tools.
-7. With both library channels configured, run `/newpost`, send a photo, a
-   multi-line caption, then one or more files captioned `1080p`, `720p`, etc.
-   Send `/done` and verify both channel posts and the buttons.
+7. With `LINKS_CHANNEL` and `LIBRARY_CHANNELS` configured, forward a text test
+   post from each new category channel to the bot DM (peer cache), then run
+   `/newpost`, send a photo and a multi-line caption, choose a category button,
+   and send one or more files captioned `1080p`, `720p`, etc. Send `/done` and
+   verify the selected category channel post and the shared links post.
 8. Run `/editpost <post_id>`, send a replacement with the same quality label,
-   and confirm the button URL in `LINKS_CHANNEL` changes while the
-   `LIBRARY_CHANNEL` "Download Links" button still points to the same post.
+   and confirm the button URL in `LINKS_CHANNEL` changes while the library
+   channel's "Download Links" button still points to the same post.
+9. In `/editpost`, tap a different category button and verify the post is
+   reposted in that channel and removed from the old one.
 
-There is no automated test suite. A fast syntax check is:
+A fast syntax check and the category parsing/validation unit tests are:
 
 ```bash
-python -m compileall -q bot.py config.py database.py handlers utils
+python -m compileall -q bot.py config.py database.py handlers utils tests
+python -m unittest discover -s tests -v
 ```
 
 ---
@@ -388,25 +426,37 @@ redeploys without a second database or a local scheduler file.
 
 ### Library post flow (`/newpost`)
 
-1. The admin runs `/newpost`. The bot checks that both library channels are
-   configured and that it is an administrator with post rights in each one.
-2. The admin sends a thumbnail photo, then the title/caption text (multi-line
-   Markdown is supported), then any number of video/document files. Each file's
-   caption is only its quality label, such as `1080p` or `720p`.
-3. `/done` copies every quality file to `STORAGE_CHANNEL`, creates its bot deep
-   link, and shortens it with VPLink (falling back to the direct link if VPLink
-   fails).
-4. The bot posts the thumbnail/caption to `LINKS_CHANNEL` with one URL button
-   per quality, then posts the same content to `LIBRARY_CHANNEL` with a single
-   **📥 Download Links** button pointing at the `LINKS_CHANNEL` message.
-5. Post metadata is stored in the Turso `library_posts` and
-   `library_post_qualities` tables.
+1. The admin runs `/newpost`. The bot checks that `LINKS_CHANNEL` is configured
+   and that at least one `LIBRARY_CHANNELS` category exists.
+2. The admin sends a thumbnail photo and the title/caption text (multi-line
+   Markdown is supported). The bot then shows one inline button per configured
+   category. The admin picks a category, then sends any number of
+   video/document files. Each file's caption is only its quality label, such as
+   `1080p` or `720p`.
+3. `/done` re-resolves the selected category channel (so a channel removed
+   while the draft was open produces a clear category-specific error), copies
+   every quality file to `STORAGE_CHANNEL`, creates its bot deep link, and
+   shortens it with VPLink (falling back to the direct link if VPLink fails).
+4. The bot posts the thumbnail/caption to the shared `LINKS_CHANNEL` with one
+   URL button per quality, then posts the same content to the selected category
+   channel with a single **📥 Download Links** button pointing at the
+   `LINKS_CHANNEL` message.
+5. Post metadata, including its `category`, is stored in the Turso
+   `library_posts` and `library_post_qualities` tables. Existing rows are
+   migrated with category `default`.
 
-`/editpost <post_id>` starts a short edit session. Send a replacement
-video/document whose caption matches an existing quality label. The bot copies
-the new file to storage, regenerates/shortens the link, updates the database,
-and calls `edit_message_reply_markup` to change that button in the existing
-`LINKS_CHANNEL` message. The `LIBRARY_CHANNEL` button does not need to change.
+`/editpost <post_id>` starts a short edit session. It looks up the stored
+category and validates it, then shows the current category and a category
+keyboard. Send a replacement video/document whose caption matches an existing
+quality label: the bot copies the new file to storage, regenerates/shortens the
+link, updates the database, and calls `edit_message_reply_markup` to change that
+button in the existing `LINKS_CHANNEL` message.
+
+To move the post, tap a category button. The bot reposts the library message in
+the selected category channel, deletes the old library message, and updates the
+stored `category`, `library_channel_id`, `library_message_id`, and message link.
+If the repost or database update fails, the old post is kept. If the old message
+cannot be deleted, the bot reports it so an admin can remove it manually.
 
 ### Admin commands
 
@@ -415,8 +465,8 @@ and calls `edit_message_reply_markup` to change that button in the existing
 | `/stats` | Files stored, unique users who used `/start`, known users, pending deletions |
 | `/broadcast` (reply) | Copy the replied message to every known user |
 | `/broadcast <text>` | Send plain text to every known user |
-| `/newpost` | Guided thumbnail + caption + quality-file library post |
-| `/editpost <post_id>` | Replace one quality file and update its button URL |
+| `/newpost` | Guided thumbnail + caption + category + quality-file library post |
+| `/editpost <post_id>` | Replace one quality file or move the post to another category |
 | `/cancel` | Abort an active `/newpost` or `/editpost` draft |
 
 Broadcasts send with a 50 ms delay and respect `FloodWait` by sleeping and
@@ -464,8 +514,8 @@ Make sure `.env` is not committed (it is already in `.gitignore`).
    - `VPLINK_API_KEY`
    - `TURSO_DATABASE_URL`
    - `TURSO_AUTH_TOKEN`
-   - optional: `LINKS_CHANNEL`, `LIBRARY_CHANNEL`, `FORCE_SUB_CHANNEL`,
-     `FORCE_SUB_INVITE_LINK`
+   - optional: `LINKS_CHANNEL`, `LIBRARY_CHANNELS` (or legacy
+     `LIBRARY_CHANNEL`), `FORCE_SUB_CHANNEL`, `FORCE_SUB_INVITE_LINK`
 6. Click **Deploy**. `PYTHON_VERSION`, `DATA_DIR=/tmp/telebot-data`,
    `AUTO_DELETE_SECONDS`, `SESSION_NAME` and `LOG_LEVEL` are already defined in
    `render.yaml`.
@@ -640,21 +690,38 @@ telebot/
 
 **`/newpost` says library posting is not configured**
 
-- Set both `LINKS_CHANNEL` and `LIBRARY_CHANNEL` in `.env`, then restart.
+- Set `LINKS_CHANNEL` and `LIBRARY_CHANNELS` in `.env`, then restart.
+- The old `LIBRARY_CHANNEL` setting still works as category `default`, but
+  `LIBRARY_CHANNELS` is preferred.
 - Use a public `@username` or the numeric `-100...` channel ID.
+- Category names and channels must use `category:@channel` or
+  `category:-100...`; separate entries with commas and do not add spaces
+  around the category/channel.
+
+**A category is reported as unavailable**
+
+- The error names the category. Add the bot as an administrator with **Post
+  Messages** permission in that category's channel.
+- For numeric `-100...` channels, forward a text test post from the channel to
+  the bot's private DM once to cache its peer/access hash, then retry.
+- Other categories remain usable even if one category is broken.
 
 **`/newpost` or `/editpost` says the bot is not an administrator**
 
-- Add the bot as an administrator in both library channels.
-- Grant **Post Messages** in both channels.
+- Add the bot as an administrator in the shared `LINKS_CHANNEL` and every
+  category channel you use.
+- Grant **Post Messages** in all of them.
 - For `/editpost`, the bot must still be able to edit the original
-  `LINKS_CHANNEL` message; deleting that message makes the edit impossible.
+  `LINKS_CHANNEL` message; deleting that message makes the quality edit
+  impossible. It must also be able to delete the old library message when
+  moving a post to another category.
 
 **Post creation failed after uploading files**
 
 - Check the caption uses valid Telegram Markdown and is at most 1024
   characters.
-- Confirm both library channels still allow the bot to post.
+- Confirm the selected category channel and `LINKS_CHANNEL` still allow the bot
+  to post.
 - The bot removes partial channel posts when a later step fails, but files
   already copied to `STORAGE_CHANNEL` remain there and can be reused.
 

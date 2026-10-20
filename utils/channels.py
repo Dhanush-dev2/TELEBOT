@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
+
 from pyrogram import Client, enums
 from pyrogram.errors import (
     ChannelInvalid,
@@ -19,6 +22,8 @@ from pyrogram.types import Chat
 
 from config import ChatRef
 from utils import pyrogram_compat  # noqa: F401 - widen peer-ID bounds first
+
+logger = logging.getLogger(__name__)
 
 _CHANNEL_LOOKUP_ERRORS = (
     PeerIdInvalid,
@@ -104,3 +109,70 @@ async def require_channel_admin(
                 "does not have permission to post messages. Enable the "
                 "'Post Messages' admin permission for the bot."
             )
+
+
+async def resolve_library_category(
+    app: Client,
+    category: str,
+    channels: Mapping[str, ChatRef],
+) -> Chat:
+    """Resolve one configured library category and verify posting rights."""
+    chat_ref = channels.get(category)
+    if chat_ref is None:
+        raise RuntimeError(
+            f"Library category {category!r} is not configured in "
+            "LIBRARY_CHANNELS."
+        )
+
+    env_name = f"LIBRARY_CHANNELS[{category}]"
+    chat = await resolve_channel(app, chat_ref, env_name)
+    await require_channel_admin(
+        app,
+        chat,
+        chat_ref,
+        env_name,
+        require_post_permission=True,
+    )
+    return chat
+
+
+async def validate_library_channels(
+    app: Client,
+    channels: Mapping[str, ChatRef],
+) -> dict[str, Chat]:
+    """Validate every category independently and log per-category failures.
+
+    A bad category must not prevent the remaining categories (or the rest of
+    the bot) from starting. The handler re-resolves the selected category when
+    it is used, so a channel that disappears later still produces a clear
+    category-specific error for the admin.
+    """
+    if not channels:
+        logger.warning(
+            "LIBRARY_CHANNELS is not configured; /newpost and /editpost "
+            "category selection are unavailable"
+        )
+        return {}
+
+    resolved: dict[str, Chat] = {}
+    for category in channels:
+        try:
+            chat = await resolve_library_category(app, category, channels)
+        except RuntimeError as exc:
+            logger.error(
+                "Library category %r is unavailable: %s", category, exc
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected error validating library category %r", category
+            )
+        else:
+            resolved[category] = chat
+            logger.info(
+                "Library category %r: %s (id=%s)",
+                category,
+                chat.title or chat.username or str(chat.id),
+                chat.id,
+            )
+
+    return resolved
