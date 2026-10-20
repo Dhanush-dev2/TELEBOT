@@ -1,0 +1,58 @@
+# Render Blueprint for the free web-service tier.
+#
+# PORT is injected automatically by Render. Do not define it here.
+# All persistent bot data lives in Turso; DATA_DIR only holds the disposable
+# Pyrogram session file.
+services:
+  - type: web
+    name: telebot
+    runtime: python
+    plan: free
+    buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python -u bot.py"
+    healthCheckPath: /
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: STORAGE_CHANNEL
+        sync: false
+      - key: VPLINK_API_KEY
+        sync: false
+
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+
+      # Optional: required only for /newpost and /editpost.
+      - key: LINKS_CHANNEL
+        sync: false
+      - key: LIBRARY_CHANNEL
+        sync: false
+
+      # Optional force-subscribe gate.
+      - key: FORCE_SUB_CHANNEL
+        sync: false
+      - key: FORCE_SUB_INVITE_LINK
+        sync: false
+
+      - key: AUTO_DELETE_SECONDS
+        value: 600
+      - key: DATA_DIR
+        value: /tmp/telebot-data
+      - key: SESSION_NAME
+        value: telebot
+      - key: LOG_LEVEL
+        value: INFO
