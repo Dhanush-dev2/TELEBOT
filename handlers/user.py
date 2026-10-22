@@ -230,8 +230,7 @@ def register(app: Client) -> None:
     app.add_handler(
         MessageHandler(handle_start, filters.private & filters.command("start"))
     )
+    # CallbackQuery has no .chat attribute; filter on callback_data instead.
     app.add_handler(
-        CallbackQueryHandler(
-            handle_check_sub, filters.private & CHECK_SUB_FILTER
-        )
+        CallbackQueryHandler(handle_check_sub, CHECK_SUB_FILTER)
     )

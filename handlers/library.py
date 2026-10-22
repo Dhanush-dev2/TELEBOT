@@ -148,14 +148,9 @@ def _clear_sessions(user_id: int) -> None:
     _migrate_sessions.pop(user_id, None)
 
 
-def _is_admin_callback(_, __, query: CallbackQuery) -> bool:
-    return (
-        query.from_user is not None
-        and query.from_user.id in settings.admin_ids
-    )
-
-
-ADMIN_CALLBACK = filters.create(_is_admin_callback)
+# CallbackQuery has no .chat attribute, so filters.private cannot be used on
+# callback handlers. filters.user only reads query.from_user.
+ADMIN_CALLBACK = filters.user(list(settings.admin_ids))
 
 
 def _category_keyboard(
