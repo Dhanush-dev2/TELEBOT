@@ -814,10 +814,16 @@ class EditEpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rolled back", send.await_args.args[2])
 
     def test_migration_label_ignores_title_and_placeholder(self) -> None:
-        series = {"episode_count": 2}
+        series = {"episode_count": 2, "title": "Black Clover"}
 
         self.assertEqual(
             library._migration_episode_label(None, series), "Episode 3"
+        )
+        self.assertEqual(
+            library._migration_episode_label(
+                "Black Clover", series, customized=True
+            ),
+            "Episode 3",
         )
         self.assertEqual(
             library._migration_episode_label(
