@@ -26,8 +26,8 @@ in a private channel and gives users self-destructing download links.
 - A built-in aiohttp server answers `GET /` with `OK` on Render's `PORT` so an
   external uptime monitor can keep the free web service awake.
 - `/stats`, `/broadcast`, `/newseries`, `/addepisode`, `/listseries`,
-  `/migrateposts`, `/newpost` and `/editpost` admin commands, with
-  FloodWait-aware retries.
+  `/deletepost`, `/migrateposts`, `/newpost` and `/editpost` admin commands,
+  with FloodWait-aware retries.
 
 ---
 
@@ -40,7 +40,7 @@ in a private channel and gives users self-destructing download links.
 - Optional: a force-subscribe channel where the bot is an administrator
 - Optional: `LINKS_CHANNEL` and one or more `LIBRARY_CHANNELS` where the bot is
   an administrator (required for `/newseries`, `/addepisode`, `/listseries`,
-  `/migrateposts`, `/newpost` and `/editpost`)
+  `/deletepost`, `/migrateposts`, `/newpost` and `/editpost`)
 - A VPLink API key
 - A Turso account and database (free tier is enough; see section 3)
 
@@ -186,6 +186,12 @@ remaining episodes. Nothing is changed when the limit is hit.
 
 `/listseries` shows every series with its category, episode count, quality-link
 count and the Library/Links channel message links.
+
+`/deletepost <id>` removes a catalog entry after an explicit confirmation. The
+ID is matched against legacy posts first, then series, so the confirmation names
+the matched type. Channel message deletion is best effort; the database rows are
+removed even if a message was already deleted. Deleting a series also removes
+all of its episodes and quality links in one transaction.
 
 Legacy `/newpost` creates a single episode-less legacy post. `/editpost` still
 works for legacy posts that have not been migrated. If a legacy post was
@@ -363,8 +369,8 @@ prints a list of problems and exits before connecting to Telegram.
 
 `*` `LINKS_CHANNEL` and at least one library category (`LIBRARY_CHANNELS`, or
 the legacy `LIBRARY_CHANNEL`) are optional for normal file delivery, but are
-required for `/newseries`, `/addepisode`, `/listseries`, `/migrateposts`,
-`/newpost` and `/editpost`.
+required for `/newseries`, `/addepisode`, `/listseries`, `/deletepost`,
+`/migrateposts`, `/newpost` and `/editpost`.
 `TURSO_AUTH_TOKEN` is required for remote `libsql://` and `https://` URLs; it
 can be empty only when using a local `file:` test database.
 
@@ -456,9 +462,12 @@ PowerShell equivalent: `Invoke-WebRequest http://127.0.0.1:8080/`.
 13. Legacy fallback: run `/newpost` and `/editpost <post_id>` on an unmigrated
     legacy post and verify they still work. Confirm `/editpost` refuses a post
     that was migrated into a series.
+14. Run `/deletepost <id>` for a disposable legacy post or series. Verify the
+    confirmation names the matched type, cancel once, then confirm and check
+    that both channel messages and the database rows are gone.
 
-A fast syntax check and the unit tests (category parsing/validation plus
-migration state tracking) are:
+A fast syntax check and the unit tests (category parsing/validation, callback
+filters, migration state tracking and catalog deletion) are:
 
 ```bash
 python -m compileall -q bot.py config.py database.py handlers utils tests
@@ -623,6 +632,7 @@ episode is not supported by the legacy command.
 | `/newseries` | Create one series with Episode 1 and both channel posts |
 | `/addepisode [category]` | Append an episode row to an existing series Links Channel post |
 | `/listseries` | Show series, categories, episode counts and channel links |
+| `/deletepost <id>` | Delete a legacy post or series and its channel messages |
 | `/migrateposts` | Interactive one-time migration of legacy posts |
 | `/migrateposts <post_id>` | Start migration at a specific legacy post |
 | `/migrateposts status` | Report migrated vs pending legacy posts only |
@@ -813,7 +823,7 @@ telebot/
 ├── handlers/
 │   ├── __init__.py
 │   ├── admin.py                # upload handling, /stats, /broadcast
-│   ├── library.py              # /newseries, /addepisode, /listseries, /migrateposts, legacy /newpost, /editpost
+│   ├── library.py              # /newseries, /addepisode, /listseries, /deletepost, /migrateposts, legacy /newpost, /editpost
 │   └── user.py                 # /start, force-sub gate, delivery, user logging
 ├── utils/
 │   ├── __init__.py

@@ -1,7 +1,7 @@
 """Admin library workflow.
 
-Series commands: /newseries, /addepisode, /listseries and the one-time
-/migrateposts bridge. Legacy commands: /newpost and /editpost.
+Series commands: /newseries, /addepisode, /listseries, /deletepost and the
+one-time /migrateposts bridge. Legacy commands: /newpost and /editpost.
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ _MANAGEMENT_COMMANDS = {
     "addepisode",
     "listseries",
     "migrateposts",
+    "deletepost",
     "cancel",
 }
 
@@ -112,10 +113,36 @@ class MigrateDraft:
     series_page: int = 0
 
 
+@dataclass
+class DeletePostDraft:
+    """Pending /deletepost confirmation for one catalog entry."""
+
+    entry_type: str
+    entry_id: int
+    title: str
+
+
+@dataclass
+class CatalogDeleteResult:
+    """Outcome of a best-effort channel cleanup plus database deletion."""
+
+    entry_type: str
+    entry_id: int
+    library_ok: bool = False
+    library_error: Optional[str] = None
+    links_ok: bool = False
+    links_error: Optional[str] = None
+    db_ok: bool = False
+    db_error: Optional[str] = None
+    episode_count: int = 0
+    link_count: int = 0
+
+
 _newpost_sessions: dict[int, NewPostDraft] = {}
 _editpost_sessions: dict[int, EditPostDraft] = {}
 _series_sessions: dict[int, SeriesDraft] = {}
 _migrate_sessions: dict[int, MigrateDraft] = {}
+_deletepost_sessions: dict[int, DeletePostDraft] = {}
 
 
 def _command_name(message: Message) -> Optional[str]:
@@ -146,6 +173,7 @@ def _clear_sessions(user_id: int) -> None:
     _editpost_sessions.pop(user_id, None)
     _series_sessions.pop(user_id, None)
     _migrate_sessions.pop(user_id, None)
+    _deletepost_sessions.pop(user_id, None)
 
 
 # CallbackQuery has no .chat attribute, so filters.private cannot be used on
@@ -1654,7 +1682,9 @@ async def handle_listseries(client: Client, message: Message) -> None:
     if not series_list:
         text = (
             "📺 <b>No series yet.</b>\n\n"
-            "Create your first series with /newseries."
+            "Create your first series with /newseries.\n\n"
+            "🗑 Use <code>/deletepost &lt;id&gt;</code> to remove a legacy "
+            "post or series."
         )
         if pending_status["pending"]:
             text += (
@@ -1732,8 +1762,12 @@ async def handle_listseries(client: Client, message: Message) -> None:
     if pending_status["pending"]:
         chunk += (
             f"ℹ️ <b>{pending_status['pending']}</b> legacy post(s) are still "
-            "waiting for /migrateposts."
+            "waiting for /migrateposts.\n\n"
         )
+    chunk += (
+        "🗑 Use <code>/deletepost &lt;id&gt;</code> to delete a series or "
+        "legacy post."
+    )
     await send_message(
         client, message.chat.id, chunk, disable_web_page_preview=True
     )
@@ -3236,6 +3270,432 @@ async def handle_migrateposts(client: Client, message: Message) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Catalog deletion (/deletepost)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_entry_label(entry_type: str) -> str:
+    return "Legacy Post" if entry_type == "post" else "Series"
+
+
+async def _resolve_series_delete_channels(
+    client: Client, series: dict
+) -> tuple[Optional[Chat], Optional[Chat]]:
+    """Resolve the channels that hold a series' two channel messages."""
+    category = str(series.get("category") or "default")
+    library_chat: Optional[Chat] = None
+    links_chat: Optional[Chat] = None
+
+    try:
+        library_chat = await resolve_library_category(
+            client, category, settings.library_channels
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve library category %r for deleting series #%s: %s",
+            category,
+            series.get("id"),
+            exc,
+        )
+
+    if settings.links_channel:
+        try:
+            links_chat = await resolve_channel(
+                client, settings.links_channel, "LINKS_CHANNEL"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve LINKS_CHANNEL for deleting series #%s: %s",
+                series.get("id"),
+                exc,
+            )
+
+    return library_chat, links_chat
+
+
+async def _catalog_entry_links(
+    client: Client, entry: dict
+) -> tuple[Optional[str], Optional[str]]:
+    """Build the Library/Links message links shown in the confirmation."""
+    data = entry["data"]
+    if entry["entry_type"] == "post":
+        return (
+            data.get("library_message_link"),
+            data.get("links_message_link"),
+        )
+
+    library_chat, links_chat = await _resolve_series_delete_channels(
+        client, data
+    )
+    return (
+        _message_link(library_chat, data.get("library_channel_message_id")),
+        _message_link(links_chat, data.get("links_channel_message_id")),
+    )
+
+
+async def handle_deletepost(client: Client, message: Message) -> None:
+    """Start the /deletepost <id> confirmation flow."""
+    if message.from_user is None:
+        return
+
+    args = message.command[1:] if message.command else []
+    if len(args) != 1:
+        await send_message(
+            client,
+            message.chat.id,
+            "Usage: <code>/deletepost &lt;id&gt;</code>\n\n"
+            "The ID can refer to a legacy post or a series.",
+        )
+        return
+
+    try:
+        entry_id = int(args[0])
+    except ValueError:
+        await send_message(
+            client,
+            message.chat.id,
+            "❌ The ID must be a number.",
+        )
+        return
+
+    try:
+        entry = await database.resolve_catalog_entry(entry_id)
+    except Exception:
+        logger.exception("Failed to resolve catalog entry #%s", entry_id)
+        await send_message(
+            client,
+            message.chat.id,
+            "❌ Could not read the catalog from the database.",
+        )
+        return
+
+    if entry is None:
+        await send_message(
+            client,
+            message.chat.id,
+            f"No legacy post or series found with ID {entry_id}.",
+        )
+        return
+
+    entry_type = entry["entry_type"]
+    data = entry["data"]
+    title = str(data.get("title") or "Untitled")
+    category = str(data.get("category") or "default")
+    library_link, links_link = await _catalog_entry_links(client, entry)
+    label = _catalog_entry_label(entry_type)
+
+    _clear_sessions(message.from_user.id)
+    _deletepost_sessions[message.from_user.id] = DeletePostDraft(
+        entry_type=entry_type,
+        entry_id=entry_id,
+        title=title,
+    )
+
+    text = (
+        f"🗑 <b>Delete {label} #{entry_id}</b>\n\n"
+        f"🎬 <b>Title:</b> {html.escape(title)}\n"
+        f"🗂 <b>Category:</b> {html.escape(category)}\n"
+    )
+    if entry_type == "series":
+        text += (
+            f"🎞 <b>Episodes:</b> "
+            f"{int(data.get('episode_count') or 0)}\n"
+        )
+
+    text += (
+        "\n📚 <b>Library Channel message:</b>\n"
+        f"{html.escape(library_link) if library_link else '<i>unavailable</i>'}"
+        "\n\n"
+        "🔗 <b>Links Channel message:</b>\n"
+        f"{html.escape(links_link) if links_link else '<i>unavailable</i>'}"
+        "\n\n"
+        "Channel message deletion is best effort. The database records are "
+        "then removed. This cannot be undone."
+    )
+
+    await send_message(
+        client,
+        message.chat.id,
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Confirm Delete",
+                        callback_data=(
+                            f"delpost:confirm:{entry_type}:{entry_id}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel",
+                        callback_data="delpost:cancel",
+                    )
+                ],
+            ]
+        ),
+        disable_web_page_preview=True,
+    )
+
+
+async def _delete_channel_message(
+    client: Client,
+    chat_id: Optional[int],
+    message_id: Optional[int],
+    label: str,
+) -> tuple[bool, Optional[str]]:
+    """Delete one channel message, reporting rather than raising failures."""
+    if chat_id is None or message_id is None:
+        return False, f"{label} message ID is not stored"
+
+    try:
+        await client.delete_messages(
+            chat_id=int(chat_id),
+            message_ids=[int(message_id)],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not delete %s message %s in chat %s: %s",
+            label,
+            message_id,
+            chat_id,
+            exc,
+            exc_info=True,
+        )
+        detail = str(exc).strip()
+        error = (
+            f"{type(exc).__name__}: {detail}"
+            if detail
+            else type(exc).__name__
+        )
+        return False, error
+
+    return True, None
+
+
+async def _delete_catalog_entry(
+    client: Client, entry_type: str, entry_id: int
+) -> Optional[CatalogDeleteResult]:
+    """Delete both channel messages and the database rows for one entry."""
+    entry = await database.resolve_catalog_entry(entry_id)
+    if entry is None or entry["entry_type"] != entry_type:
+        return None
+
+    data = entry["data"]
+    result = CatalogDeleteResult(entry_type=entry_type, entry_id=entry_id)
+
+    if entry_type == "post":
+        library_chat_id = data.get("library_channel_id")
+        library_message_id = data.get("library_message_id")
+        links_chat_id = data.get("links_channel_id")
+        links_message_id = data.get("links_message_id")
+    else:
+        library_chat, links_chat = await _resolve_series_delete_channels(
+            client, data
+        )
+        library_chat_id = library_chat.id if library_chat else None
+        links_chat_id = links_chat.id if links_chat else None
+        library_message_id = data.get("library_channel_message_id")
+        links_message_id = data.get("links_channel_message_id")
+        if library_chat is None:
+            result.library_error = "the Library Channel could not be resolved"
+        if links_chat is None:
+            result.links_error = "the Links Channel could not be resolved"
+
+    if result.library_error is None:
+        result.library_ok, result.library_error = (
+            await _delete_channel_message(
+                client,
+                library_chat_id,
+                library_message_id,
+                "Library Channel",
+            )
+        )
+    if result.links_error is None:
+        result.links_ok, result.links_error = await _delete_channel_message(
+            client,
+            links_chat_id,
+            links_message_id,
+            "Links Channel",
+        )
+
+    try:
+        if entry_type == "post":
+            result.db_ok = await database.delete_library_post(entry_id)
+            if not result.db_ok:
+                result.db_error = "the legacy post no longer exists"
+        else:
+            counts = await database.delete_series_with_counts(entry_id)
+            if counts is None:
+                result.db_error = "the series no longer exists"
+            else:
+                result.db_ok = True
+                result.episode_count = int(counts["episode_count"])
+                result.link_count = int(counts["link_count"])
+    except Exception as exc:
+        logger.exception(
+            "Failed to delete %s #%s from the database",
+            entry_type,
+            entry_id,
+        )
+        result.db_error = str(exc) or type(exc).__name__
+
+    return result
+
+
+def _deletion_failure_line(label: str, error: Optional[str]) -> str:
+    if not error:
+        return f"⚠️ {label} message was skipped"
+
+    lowered = error.casefold()
+    if "not stored" in lowered:
+        return f"⚠️ {label} message was skipped (no message ID stored)"
+    if any(
+        marker in lowered
+        for marker in (
+            "message_id_invalid",
+            "messageidinvalid",
+            "message id is invalid",
+            "message to delete not found",
+            "already deleted",
+            "not found",
+        )
+    ):
+        return f"⚠️ {label} message was already deleted (skipped)"
+    return (
+        f"⚠️ {label} message could not be deleted: "
+        f"{html.escape(error)}"
+    )
+
+
+def _format_catalog_delete_report(result: CatalogDeleteResult) -> str:
+    label = _catalog_entry_label(result.entry_type)
+    lines = [f"🗑 <b>{label} #{result.entry_id}</b>", ""]
+
+    if result.library_ok:
+        lines.append("✅ Deleted Library Channel message")
+    else:
+        lines.append(
+            _deletion_failure_line("Library Channel", result.library_error)
+        )
+
+    if result.links_ok:
+        lines.append("✅ Deleted Links Channel message")
+    else:
+        lines.append(
+            _deletion_failure_line("Links Channel", result.links_error)
+        )
+
+    if result.db_ok:
+        lines.append("✅ Removed database records")
+        if result.entry_type == "series":
+            episode_word = (
+                "episode" if result.episode_count == 1 else "episodes"
+            )
+            pronoun = "its" if result.episode_count == 1 else "their"
+            lines.append(
+                f"🎞 Removed {result.episode_count} {episode_word} and "
+                f"{pronoun} links."
+            )
+    else:
+        lines.append(
+            "❌ Database deletion failed: "
+            f"{html.escape(result.db_error or 'unknown error')}"
+        )
+
+    return "\n".join(lines)
+
+
+async def handle_deletepost_callback(
+    client: Client, query: CallbackQuery
+) -> None:
+    """Handle the confirm/cancel buttons from /deletepost."""
+    data = query.data or ""
+    if not data.startswith("delpost:"):
+        return
+    if query.from_user is None:
+        await query.answer()
+        return
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id if query.message else user_id
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "cancel" and len(parts) == 2:
+        _deletepost_sessions.pop(user_id, None)
+        await query.answer("Cancelled")
+        await send_message(client, chat_id, "Deletion cancelled.")
+        return
+
+    if action == "confirm" and len(parts) == 4:
+        entry_type = parts[2]
+        try:
+            entry_id = int(parts[3])
+        except ValueError:
+            await query.answer(
+                "Invalid deletion action.", show_alert=True
+            )
+            return
+        if entry_type not in ("post", "series"):
+            await query.answer(
+                "Invalid deletion action.", show_alert=True
+            )
+            return
+
+        draft = _deletepost_sessions.get(user_id)
+        if (
+            draft is None
+            or draft.entry_type != entry_type
+            or draft.entry_id != entry_id
+        ):
+            await query.answer(
+                "This deletion request is no longer active.",
+                show_alert=True,
+            )
+            return
+
+        _deletepost_sessions.pop(user_id, None)
+        await query.answer("Deleting...")
+        try:
+            result = await _delete_catalog_entry(
+                client, entry_type, entry_id
+            )
+        except Exception as exc:
+            logger.exception(
+                "Unexpected failure deleting %s #%s",
+                entry_type,
+                entry_id,
+            )
+            await send_message(
+                client,
+                chat_id,
+                "❌ Deletion failed: "
+                f"{html.escape(str(exc) or type(exc).__name__)}",
+            )
+            return
+
+        if result is None:
+            await send_message(
+                client,
+                chat_id,
+                f"No legacy post or series found with ID {entry_id}.",
+            )
+            return
+
+        await send_message(
+            client,
+            chat_id,
+            _format_catalog_delete_report(result),
+            disable_web_page_preview=True,
+        )
+        return
+
+    await query.answer("Invalid deletion action.", show_alert=True)
+
+
 def register(app: Client) -> None:
     """Register library-post handlers. Called explicitly from bot.py."""
     # Group -2 captures the guided flow before the normal upload handler in
@@ -3279,6 +3739,13 @@ def register(app: Client) -> None:
     )
     app.add_handler(
         MessageHandler(
+            handle_deletepost,
+            ADMIN_PRIVATE & filters.command("deletepost"),
+        ),
+        group=-2,
+    )
+    app.add_handler(
+        MessageHandler(
             handle_cancel, ADMIN_PRIVATE & filters.command("cancel")
         ),
         group=-2,
@@ -3293,11 +3760,18 @@ def register(app: Client) -> None:
         ),
         group=-2,
     )
+    # Pyrogram stops after the first matching handler in a group. Every admin
+    # callback shares ADMIN_CALLBACK, so each data-prefix owner needs its own
+    # group to receive the update.
     app.add_handler(
         CallbackQueryHandler(handle_series_action_callback, ADMIN_CALLBACK),
-        group=-2,
+        group=-3,
     )
     app.add_handler(
         CallbackQueryHandler(handle_migration_callback, ADMIN_CALLBACK),
-        group=-2,
+        group=-4,
+    )
+    app.add_handler(
+        CallbackQueryHandler(handle_deletepost_callback, ADMIN_CALLBACK),
+        group=-5,
     )

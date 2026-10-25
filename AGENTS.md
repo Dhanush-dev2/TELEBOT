@@ -38,3 +38,4 @@ Full setup, deployment and troubleshooting steps are in `README.md`.
 - `/start` delivery must copy the file, immediately send the warning, then write one durable `pending_deletions` row and register the in-memory APScheduler job.
 - Broadcast text is sent with HTML parse mode disabled; media broadcasts use `copy_message`.
 - User logging runs in handler group `-1`; moving it to group 0 would compete with the command/upload handlers.
+- Admin callback handlers share `ADMIN_CALLBACK`, so each data-prefix owner is registered in its own handler group. Pyrogram stops after the first matching handler in a group.

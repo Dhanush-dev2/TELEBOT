@@ -81,17 +81,24 @@ class CallbackFilterTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         admin_id = next(iter(settings.admin_ids))
         callback_handlers: list[CallbackQueryHandler] = []
+        callback_groups: list[int] = []
 
         for module in (library, user):
             app = MagicMock()
             module.register(app)
-            callback_handlers.extend(
-                call.args[0]
-                for call in app.add_handler.call_args_list
-                if isinstance(call.args[0], CallbackQueryHandler)
-            )
+            for call in app.add_handler.call_args_list:
+                if isinstance(call.args[0], CallbackQueryHandler):
+                    callback_handlers.append(call.args[0])
+                    callback_groups.append(call.kwargs.get("group", 0))
 
-        self.assertEqual(len(callback_handlers), 4)
+        self.assertEqual(len(callback_handlers), 5)
+        # Pyrogram runs only the first matching handler in a group. These
+        # handlers all share ADMIN_CALLBACK, so they must not share a group.
+        self.assertEqual(
+            len(set(callback_groups)),
+            len(callback_handlers),
+            msg=f"callback handlers share groups: {callback_groups}",
+        )
         for handler in callback_handlers:
             data = (
                 f"{user.CHECK_SUB_PREFIX}example-file"

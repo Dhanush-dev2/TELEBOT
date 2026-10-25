@@ -775,6 +775,78 @@ async def delete_series(series_id: int) -> None:
     )
 
 
+async def resolve_catalog_entry(entry_id: int) -> Optional[dict]:
+    """Resolve an ID to a legacy post first, then to a series.
+
+    The two tables have independent ID sequences, so legacy posts win when the
+    same numeric ID exists in both.
+    """
+    post = await get_library_post(entry_id)
+    if post is not None:
+        return {"entry_type": "post", "data": post}
+
+    series = await get_series(entry_id)
+    if series is not None:
+        return {"entry_type": "series", "data": series}
+    return None
+
+
+async def delete_library_post(post_id: int) -> bool:
+    """Remove a legacy post and its quality rows atomically."""
+    results = await _get_client().batch(
+        [
+            (
+                "DELETE FROM library_post_qualities WHERE post_id = ?",
+                (post_id,),
+            ),
+            ("DELETE FROM library_posts WHERE id = ?", (post_id,)),
+        ]
+    )
+    return bool(results and results[-1].rows_affected)
+
+
+async def delete_series_with_counts(series_id: int) -> Optional[dict]:
+    """Remove a series and all children atomically, returning removed counts.
+
+    The count query and every delete run in one batch transaction. ``None`` is
+    returned when the series row itself no longer exists.
+    """
+    statements = [
+        (
+            """
+            SELECT
+                (SELECT COUNT(*) FROM episodes
+                 WHERE series_id = ?) AS episode_count,
+                (SELECT COUNT(*) FROM episode_links l
+                 JOIN episodes e ON e.id = l.episode_id
+                 WHERE e.series_id = ?) AS link_count
+            """,
+            (series_id, series_id),
+        ),
+        (
+            """
+            DELETE FROM episode_links
+            WHERE episode_id IN (
+                SELECT id FROM episodes WHERE series_id = ?
+            )
+            """,
+            (series_id,),
+        ),
+        ("DELETE FROM episodes WHERE series_id = ?", (series_id,)),
+        ("DELETE FROM series WHERE id = ?", (series_id,)),
+    ]
+
+    results = await _get_client().batch(statements)
+    if len(results) < len(statements) or not results[-1].rows_affected:
+        return None
+
+    row = results[0].rows[0] if results[0].rows else None
+    return {
+        "episode_count": int(row["episode_count"] or 0) if row else 0,
+        "link_count": int(row["link_count"] or 0) if row else 0,
+    }
+
+
 async def create_series_from_library_post(post_id: int) -> Optional[int]:
     """Create a series + Episode 1 from an existing library_posts row.
 
