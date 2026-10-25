@@ -813,6 +813,470 @@ class EditEpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(1, library._editepisode_sessions)
         self.assertIn("rolled back", send.await_args.args[2])
 
+    async def test_bare_editepisode_opens_series_picker(self) -> None:
+        series_id = await self._add_series(title="Picker Series")
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            command=["editepisode"],
+        )
+        fake_settings = SimpleNamespace(
+            library_channels={"anime": object(), "movies": object()}
+        )
+
+        with (
+            patch.object(library, "settings", fake_settings),
+            patch.object(library, "send_message", new=AsyncMock()) as send,
+        ):
+            await library.handle_editepisode(SimpleNamespace(), message)
+
+        text = send.await_args.args[2]
+        keyboard = send.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("Edit an episode", text)
+        self.assertIn(f"edep:s:{series_id}", callbacks)
+        self.assertIn("edep:c:-1:0", callbacks)
+        self.assertIn("edep:c:0:0", callbacks)
+        self.assertIn("edep:c:1:0", callbacks)
+        series_button = next(
+            button
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data == f"edep:s:{series_id}"
+        )
+        self.assertIn("Picker Series", series_button.text)
+        self.assertIn(str(series_id), series_button.text)
+
+    async def test_editepisode_with_series_id_opens_episode_picker(
+        self,
+    ) -> None:
+        series_id = await self._add_series(
+            episodes=[
+                (
+                    "Episode 1",
+                    [
+                        {
+                            "label": "1080p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/1",
+                        }
+                    ],
+                ),
+                (
+                    "Episode 2",
+                    [
+                        {
+                            "label": "720p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/2",
+                        }
+                    ],
+                ),
+            ]
+        )
+        series = await database.get_series(series_id)
+        self.assertIsNotNone(series)
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            command=["editepisode", str(series_id)],
+        )
+
+        with patch.object(library, "send_message", new=AsyncMock()) as send:
+            await library.handle_editepisode(SimpleNamespace(), message)
+
+        text = send.await_args.args[2]
+        keyboard = send.await_args.kwargs["reply_markup"]
+        buttons = [
+            button
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        callbacks = [button.callback_data for button in buttons]
+        self.assertIn("Choose an episode to edit", text)
+        self.assertEqual(len(callbacks), 2)
+        self.assertTrue(
+            all(callback.startswith("edep:pick:") for callback in callbacks)
+        )
+        for episode in series["episodes"]:
+            self.assertTrue(
+                any(
+                    episode["episode_label"] in button.text
+                    and str(episode["id"]) in button.text
+                    for button in buttons
+                )
+            )
+        draft = library._editepisode_sessions[1]
+        self.assertIsNone(draft.episode)
+        self.assertEqual(draft.stage, "episode_pick")
+
+    async def test_series_picker_callback_opens_episode_picker(self) -> None:
+        series_id = await self._add_series(
+            episodes=[
+                (
+                    "Episode 1",
+                    [
+                        {
+                            "label": "1080p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/1",
+                        }
+                    ],
+                ),
+                (
+                    "Episode 2",
+                    [
+                        {
+                            "label": "720p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/2",
+                        }
+                    ],
+                ),
+            ]
+        )
+        query = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(chat=SimpleNamespace(id=1), id=77),
+            data=f"edep:s:{series_id}",
+            answer=AsyncMock(),
+        )
+
+        with (
+            patch.object(library, "_delete_status", new=AsyncMock()),
+            patch.object(library, "send_message", new=AsyncMock()) as send,
+        ):
+            await library.handle_edit_episode_callback(
+                SimpleNamespace(), query
+            )
+
+        self.assertIn(1, library._editepisode_sessions)
+        draft = library._editepisode_sessions[1]
+        self.assertEqual(draft.series_id, series_id)
+        self.assertIsNone(draft.episode)
+        self.assertEqual(draft.stage, "episode_pick")
+        text = send.await_args.args[2]
+        keyboard = send.await_args.kwargs["reply_markup"]
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("Choose an episode to edit", text)
+        self.assertEqual(len(callbacks), 2)
+        self.assertTrue(
+            all(callback.startswith("edep:pick:") for callback in callbacks)
+        )
+        query.answer.assert_awaited_once_with("Series selected")
+
+    def test_resolve_episode_by_database_id(self) -> None:
+        series = {
+            "episodes": [
+                {"id": 99, "episode_label": "Episode 1", "links": []},
+                {"id": 100, "episode_label": "Episode 2", "links": []},
+            ]
+        }
+
+        for query, expected_id in (
+            ("99", 99),
+            ("#100", 100),
+            ("id 100", 100),
+            ("ID:100", 100),
+        ):
+            matches = library._resolve_episode_candidates(series, query)
+            self.assertEqual(len(matches), 1, msg=query)
+            self.assertEqual(matches[0]["id"], expected_id, msg=query)
+
+    async def test_direct_episode_selection_by_position_opens_menu(
+        self,
+    ) -> None:
+        series_id = await self._add_series(
+            episodes=[
+                (
+                    "Episode 1",
+                    [
+                        {
+                            "label": "1080p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/1",
+                        }
+                    ],
+                ),
+                (
+                    "Episode 2",
+                    [
+                        {
+                            "label": "720p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/2",
+                        }
+                    ],
+                ),
+            ]
+        )
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            command=["editepisode", str(series_id), "2"],
+        )
+
+        with patch.object(library, "send_message", new=AsyncMock()) as send:
+            await library.handle_editepisode(SimpleNamespace(), message)
+
+        draft = library._editepisode_sessions[1]
+        self.assertIsNotNone(draft.episode)
+        self.assertEqual(draft.episode["episode_label"], "Episode 2")
+        self.assertIn("Edit episode", send.await_args.args[2])
+        self.assertTrue(
+            any(
+                "Rename Episode" in button.text
+                for row in send.await_args.kwargs[
+                    "reply_markup"
+                ].inline_keyboard
+                for button in row
+            )
+        )
+
+    async def test_direct_episode_selection_by_label_opens_menu(
+        self,
+    ) -> None:
+        series_id = await self._add_series(
+            episodes=[
+                (
+                    "Episode 1",
+                    [
+                        {
+                            "label": "1080p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/1",
+                        }
+                    ],
+                ),
+                (
+                    "Special",
+                    [
+                        {
+                            "label": "720p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/2",
+                        }
+                    ],
+                ),
+            ]
+        )
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            command=["editepisode", str(series_id), "Special"],
+        )
+
+        with patch.object(library, "send_message", new=AsyncMock()) as send:
+            await library.handle_editepisode(SimpleNamespace(), message)
+
+        draft = library._editepisode_sessions[1]
+        self.assertIsNotNone(draft.episode)
+        self.assertEqual(draft.episode["episode_label"], "Special")
+        self.assertIn("Edit episode", send.await_args.args[2])
+
+    async def test_rename_updates_every_quality_button(self) -> None:
+        series_id = await self._add_series(
+            episodes=[
+                (
+                    "Episode 1",
+                    [
+                        {
+                            "label": "1080p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/1",
+                        },
+                        {
+                            "label": "720p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/2",
+                        },
+                    ],
+                )
+            ]
+        )
+        series = await database.get_series(series_id)
+        self.assertIsNotNone(series)
+        draft = library.EditEpisodeDraft(
+            user_id=1,
+            series=series,
+            series_id=series_id,
+            episode=series["episodes"][0],
+            new_label="Renamed Episode",
+        )
+        edit = AsyncMock(return_value=SimpleNamespace())
+
+        with (
+            patch.object(
+                library,
+                "_ensure_library_config",
+                new=AsyncMock(return_value=self._chat()),
+            ),
+            patch.object(
+                library, "edit_message_reply_markup", new=edit
+            ),
+            patch.object(library, "send_message", new=AsyncMock()),
+        ):
+            ok = await library._apply_edit_episode(
+                SimpleNamespace(), 1, draft
+            )
+
+        self.assertTrue(ok)
+        keyboard = edit.await_args.args[3]
+        buttons = keyboard.inline_keyboard[0]
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(
+            all("Renamed Episode" in button.text for button in buttons)
+        )
+        self.assertIn("1080p", buttons[0].text)
+        self.assertIn("720p", buttons[1].text)
+
+    async def test_editepisode_rejects_placeholder_and_series_title(
+        self,
+    ) -> None:
+        series_id = await self._add_series(title="Black Clover")
+        series = await database.get_series(series_id)
+        self.assertIsNotNone(series)
+        draft = library.EditEpisodeDraft(
+            user_id=1,
+            series=series,
+            series_id=series_id,
+            episode=series["episodes"][0],
+        )
+
+        for raw, expected in (
+            ("New episode label...", "prompt text"),
+            ("Black Clover", "series title"),
+            ("   ", "cannot be empty"),
+        ):
+            with patch.object(
+                library, "send_message", new=AsyncMock()
+            ) as send:
+                await library._stage_episode_label(
+                    SimpleNamespace(), 1, draft, raw
+                )
+            self.assertIsNone(draft.new_label)
+            self.assertIn(expected, send.await_args.args[2])
+
+    async def test_apply_rejects_series_title_label(self) -> None:
+        series_id = await self._add_series(title="Black Clover")
+        series = await database.get_series(series_id)
+        self.assertIsNotNone(series)
+        draft = library.EditEpisodeDraft(
+            user_id=1,
+            series=series,
+            series_id=series_id,
+            episode=series["episodes"][0],
+            new_label="Black Clover",
+        )
+        edit = AsyncMock()
+
+        with (
+            patch.object(
+                library,
+                "_ensure_library_config",
+                new=AsyncMock(return_value=self._chat()),
+            ),
+            patch.object(
+                library, "edit_message_reply_markup", new=edit
+            ),
+            patch.object(library, "send_message", new=AsyncMock()) as send,
+        ):
+            ok = await library._apply_edit_episode(
+                SimpleNamespace(), 1, draft
+            )
+
+        self.assertFalse(ok)
+        edit.assert_not_awaited()
+        self.assertIn("series title", send.await_args.args[2])
+        refreshed = await database.get_series(series_id)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(
+            refreshed["episodes"][0]["episode_label"], "Episode 1"
+        )
+
+    async def test_stale_episode_picker_cannot_replace_selected_episode(
+        self,
+    ) -> None:
+        series_id = await self._add_series(
+            episodes=[
+                (
+                    "Episode 1",
+                    [
+                        {
+                            "label": "1080p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/1",
+                        }
+                    ],
+                ),
+                (
+                    "Episode 2",
+                    [
+                        {
+                            "label": "720p",
+                            "short_link": None,
+                            "direct_link": "https://t.me/test/2",
+                        }
+                    ],
+                ),
+            ]
+        )
+        series = await database.get_series(series_id)
+        self.assertIsNotNone(series)
+        selected = series["episodes"][0]
+        other = series["episodes"][1]
+        draft = library.EditEpisodeDraft(
+            user_id=1,
+            series=series,
+            series_id=series_id,
+            episode=selected,
+        )
+        library._editepisode_sessions[1] = draft
+        query = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            message=SimpleNamespace(chat=SimpleNamespace(id=1), id=77),
+            data=f"edep:pick:{series_id}:{other['id']}",
+            answer=AsyncMock(),
+        )
+
+        with (
+            patch.object(library, "_delete_status", new=AsyncMock()),
+            patch.object(
+                library, "_send_edit_episode_menu", new=AsyncMock()
+            ) as menu,
+        ):
+            await library.handle_edit_episode_callback(
+                SimpleNamespace(), query
+            )
+
+        self.assertEqual(draft.episode["id"], selected["id"])
+        menu.assert_not_awaited()
+        query.answer.assert_awaited_once()
+        self.assertTrue(query.answer.await_args.kwargs.get("show_alert"))
+
+    async def test_editpost_usage_points_to_editepisode(self) -> None:
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            command=["editpost"],
+        )
+
+        with patch.object(library, "send_message", new=AsyncMock()) as send:
+            await library.handle_editpost(SimpleNamespace(), message)
+
+        text = send.await_args.args[2]
+        self.assertIn("Usage:", text)
+        self.assertIn("legacy /newpost entries", text)
+        self.assertIn("/editepisode", text)
+
     def test_migration_label_ignores_title_and_placeholder(self) -> None:
         series = {"episode_count": 2, "title": "Black Clover"}
 

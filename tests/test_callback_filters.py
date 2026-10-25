@@ -99,6 +99,12 @@ class CallbackFilterTests(unittest.IsolatedAsyncioTestCase):
             len(callback_handlers),
             msg=f"callback handlers share groups: {callback_groups}",
         )
+        edit_episode_index = next(
+            index
+            for index, handler in enumerate(callback_handlers)
+            if handler.callback is library.handle_edit_episode_callback
+        )
+        self.assertEqual(callback_groups[edit_episode_index], -6)
         for handler in callback_handlers:
             data = (
                 f"{user.CHECK_SUB_PREFIX}example-file"

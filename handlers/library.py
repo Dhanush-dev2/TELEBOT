@@ -295,8 +295,9 @@ def _quality_keyboard(buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 async def _delete_status(
     client: Client, chat_id: int, status: Optional[Message]
 ) -> None:
-    if status is not None:
-        await delete_messages(client, chat_id, [status.id])
+    status_id = getattr(status, "id", None)
+    if status is not None and status_id is not None:
+        await delete_messages(client, chat_id, [status_id])
 
 
 async def _ensure_library_config(
@@ -382,8 +383,10 @@ async def handle_editpost(client: Client, message: Message) -> None:
         await send_message(
             client,
             message.chat.id,
-            "Usage: <code>/editpost &lt;post_id&gt;</code>\n\n"
-            "The post ID is shown after a successful /newpost.",
+            "Usage: <code>/editpost &lt;post_id&gt;</code>\n"
+            "This command edits legacy /newpost entries.\n"
+            "To rename or edit a series episode, use "
+            "<code>/editepisode</code>.",
         )
         return
 
@@ -1371,6 +1374,26 @@ def _validate_episode_label(raw: str) -> tuple[Optional[str], Optional[str]]:
     return label, None
 
 
+def _validate_episode_label_for_series(
+    raw: str, series: dict
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate an episode label and reject the series title as a label."""
+    label, error = _validate_episode_label(raw)
+    if error:
+        return None, error
+    series_title = str(series.get("title") or "").strip()
+    if (
+        label is not None
+        and series_title
+        and label.casefold() == series_title.casefold()
+    ):
+        return (
+            None,
+            "❌ The episode label cannot be identical to the series title.",
+        )
+    return label, None
+
+
 def _validate_quality_text(raw: str) -> tuple[Optional[str], Optional[str]]:
     label = raw.strip()
     if not label:
@@ -1795,8 +1818,10 @@ async def handle_listseries(client: Client, message: Message) -> None:
         text = (
             "📺 <b>No series yet.</b>\n\n"
             "Create your first series with /newseries.\n\n"
-            "✏️ Use <code>/editepisode &lt;series_id&gt; "
-            "&lt;episode&gt;</code> to fix an episode label or quality link.\n"
+            "✏️ Use <code>/editepisode</code> to browse series, "
+            "<code>/editepisode &lt;series_id&gt;</code> to pick an episode, "
+            "or <code>/editepisode &lt;series_id&gt; &lt;episode&gt;</code> "
+            "to edit directly.\n"
             "🗑 Use <code>/deletepost &lt;id&gt;</code> to remove a legacy "
             "post or series."
         )
@@ -1879,8 +1904,10 @@ async def handle_listseries(client: Client, message: Message) -> None:
             "waiting for /migrateposts.\n\n"
         )
     chunk += (
-        "✏️ Use <code>/editepisode &lt;series_id&gt; &lt;episode&gt;</code> "
-        "to fix an episode label or quality link.\n"
+        "✏️ Use <code>/editepisode</code> to browse series, "
+        "<code>/editepisode &lt;series_id&gt;</code> to pick an episode, or "
+        "<code>/editepisode &lt;series_id&gt; &lt;episode&gt;</code> to edit "
+        "directly.\n"
         "🗑 Use <code>/deletepost &lt;id&gt;</code> to delete a series or "
         "legacy post."
     )
@@ -1949,7 +1976,7 @@ def _match_quality_for_draft(
 
 
 def _resolve_episode_candidates(series: dict, query: str) -> list[dict]:
-    """Resolve an episode by 1-based position or exact current label."""
+    """Resolve an episode by position, database ID or exact current label."""
     raw = query.strip()
     if not raw:
         return []
@@ -1964,10 +1991,22 @@ def _resolve_episode_candidates(series: dict, query: str) -> list[dict]:
             seen.add(episode_id)
             matches.append(episode)
 
-    if raw.isdigit():
-        position = int(raw)
-        if 1 <= position <= len(episodes):
-            add(episodes[position - 1])
+    id_text = raw
+    lowered = raw.casefold()
+    if id_text.startswith("#"):
+        id_text = id_text[1:].strip()
+    elif lowered.startswith("id:"):
+        id_text = id_text[3:].strip()
+    elif lowered.startswith("id "):
+        id_text = id_text[3:].strip()
+
+    if id_text.isdigit():
+        number = int(id_text)
+        if 1 <= number <= len(episodes):
+            add(episodes[number - 1])
+        for episode in episodes:
+            if int(episode.get("id") or 0) == number:
+                add(episode)
 
     target = raw.casefold()
     for episode in episodes:
@@ -2001,9 +2040,9 @@ def _edit_episode_menu_text(draft: EditEpisodeDraft) -> str:
         "",
         f"📺 <b>Series:</b> #{series.get('id')} "
         f"{html.escape(str(series.get('title') or 'Untitled'))}",
-        f"🎞 <b>Episode:</b> "
-        f"{html.escape(str(episode.get('episode_label') or 'Episode'))} "
-        f"(position {position})",
+        f"🏷 <b>Current label:</b> "
+        f"{html.escape(str(episode.get('episode_label') or 'Episode'))}",
+        f"🎞 <b>Episode ID:</b> {episode_id} · position {position}",
         "",
         "<b>Current quality links:</b>",
     ]
@@ -2064,7 +2103,7 @@ def _edit_episode_menu_text(draft: EditEpisodeDraft) -> str:
         "• Send <code>/qlabel &lt;old_quality_label&gt; "
         "&lt;new_quality_label&gt;</code> to rename a quality.",
         "• Send <code>/label &lt;new episode label&gt;</code> or tap "
-        "✏️ Rename episode.",
+        "✏️ Rename Episode.",
         "• <code>/done</code> to apply, <code>/cancel</code> to abort.",
     ]
     text = "\n".join(lines)
@@ -2081,7 +2120,7 @@ def _edit_episode_keyboard(draft: EditEpisodeDraft) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                "✏️ Rename episode",
+                "✏️ Rename Episode",
                 callback_data=f"edep:rename:{series_id}:{episode_id}",
             )
         ]
@@ -2127,6 +2166,23 @@ async def _send_edit_episode_menu(
     )
 
 
+def _episode_picker_button_text(series: dict, episode: dict) -> str:
+    """Show the current label, position and database ID in one button."""
+    episode_id = int(episode.get("id") or 0)
+    position = _episode_position(series, episode_id)
+    label = (
+        str(episode.get("episode_label") or "Episode").strip() or "Episode"
+    )
+    prefix = f"#{position} "
+    suffix = f" · id {episode_id}"
+    available = MAX_BUTTON_TEXT_LENGTH - len(prefix) - len(suffix)
+    if available < 1:
+        return f"#{position} id {episode_id}"[:MAX_BUTTON_TEXT_LENGTH]
+    if len(label) > available:
+        label = label[: max(1, available - 1)].rstrip() + "…"
+    return f"{prefix}{label}{suffix}"[:MAX_BUTTON_TEXT_LENGTH]
+
+
 async def _send_edit_episode_picker(
     client: Client,
     chat_id: int,
@@ -2136,15 +2192,10 @@ async def _send_edit_episode_picker(
 ) -> None:
     rows = []
     for episode in candidates:
-        position = _episode_position(draft.series, int(episode["id"]))
-        label = (
-            f"#{position} "
-            f"{episode.get('episode_label') or 'Episode'}"
-        )[:MAX_BUTTON_TEXT_LENGTH]
         rows.append(
             [
                 InlineKeyboardButton(
-                    label,
+                    _episode_picker_button_text(draft.series, episode),
                     callback_data=(
                         f"edep:pick:{draft.series_id}:{episode['id']}"
                     ),
@@ -2238,7 +2289,7 @@ def _get_or_create_link_edit(
 async def _stage_episode_label(
     client: Client, chat_id: int, draft: EditEpisodeDraft, raw: str
 ) -> None:
-    label, error = _validate_episode_label(raw)
+    label, error = _validate_episode_label_for_series(raw, draft.series)
     if error:
         await send_message(client, chat_id, error)
         return
@@ -2362,23 +2413,126 @@ async def _stage_quality_file(
     await _send_edit_episode_menu(client, message.chat.id, draft)
 
 
+def _editepisode_filter_rows(
+    categories: list[str],
+) -> list[list[InlineKeyboardButton]]:
+    if not categories:
+        return []
+    buttons = [
+        InlineKeyboardButton("🌐 All", callback_data="edep:c:-1:0")
+    ]
+    for index, name in enumerate(categories):
+        buttons.append(
+            InlineKeyboardButton(
+                f"🗂 {name}"[:MAX_BUTTON_TEXT_LENGTH],
+                callback_data=f"edep:c:{index}:0",
+            )
+        )
+    return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+
+
+async def _send_editepisode_series_list(
+    client: Client,
+    chat_id: int,
+    *,
+    page: int = 0,
+    category: Optional[str] = None,
+) -> None:
+    """Show the paginated series picker used by bare /editepisode."""
+    categories = list(settings.library_channels)
+    category_index = (
+        categories.index(category) if category in categories else -1
+    )
+    try:
+        series_list = await database.list_series(category)
+    except Exception:
+        logger.exception("Failed to list series for /editepisode")
+        await send_message(
+            client,
+            chat_id,
+            "❌ Could not read the series list from the database.",
+        )
+        return
+
+    filter_rows = _editepisode_filter_rows(categories)
+    if not series_list:
+        text = "✏️ <b>Edit an episode</b>\n\n"
+        if category:
+            text += (
+                f"No series found in category <b>{html.escape(category)}</b>. "
+                "Choose another category or create one with /newseries."
+            )
+        else:
+            text += "No series found. Create one with /newseries."
+        await send_message(
+            client,
+            chat_id,
+            text,
+            reply_markup=(
+                InlineKeyboardMarkup(filter_rows) if filter_rows else None
+            ),
+        )
+        return
+
+    total_pages = max(
+        1, (len(series_list) + SERIES_PAGE_SIZE - 1) // SERIES_PAGE_SIZE
+    )
+    page = max(0, min(page, total_pages - 1))
+    start = page * SERIES_PAGE_SIZE
+    chunk = series_list[start : start + SERIES_PAGE_SIZE]
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                _series_button_text(series),
+                callback_data=f"edep:s:{series['id']}",
+            )
+        ]
+        for series in chunk
+    ]
+
+    navigation = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                "⬅️ Prev",
+                callback_data=f"edep:l:{page - 1}:{category_index}",
+            )
+        )
+    if page + 1 < total_pages:
+        navigation.append(
+            InlineKeyboardButton(
+                "Next ➡️",
+                callback_data=f"edep:l:{page + 1}:{category_index}",
+            )
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.extend(filter_rows)
+
+    text = (
+        "✏️ <b>Edit an episode</b>\n\n"
+        "Choose a series. The button shows its ID and title.\n"
+        f"Filter: <b>{html.escape(category) if category else 'all categories'}"
+        "</b>\n"
+        f"Page {page + 1}/{total_pages} · {len(series_list)} series"
+    )
+    await send_message(
+        client, chat_id, text, reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
 async def handle_editepisode(client: Client, message: Message) -> None:
-    """Start an /editepisode <series_id> <episode> session."""
+    """Start an /editepisode session or show the interactive picker."""
     if message.from_user is None:
         return
 
     args = message.command[1:] if message.command else []
-    if len(args) < 2:
-        await send_message(
-            client,
-            message.chat.id,
-            "Usage: <code>/editepisode &lt;series_id&gt; "
-            "&lt;episode_number_or_label&gt;</code>\n\n"
-            "Examples:\n"
-            "• <code>/editepisode 3 2</code>\n"
-            "• <code>/editepisode 3 Episode 2</code>\n\n"
-            "Use /listseries to find the series ID.",
-        )
+    user_id = message.from_user.id
+
+    if not args:
+        _clear_sessions(user_id)
+        await _send_editepisode_series_list(client, message.chat.id)
         return
 
     try:
@@ -2389,19 +2543,6 @@ async def handle_editepisode(client: Client, message: Message) -> None:
             message.chat.id,
             "❌ The series ID must be a number.",
         )
-        return
-
-    query = " ".join(args[1:]).strip()
-    if not query:
-        await send_message(
-            client,
-            message.chat.id,
-            "Usage: <code>/editepisode &lt;series_id&gt; "
-            "&lt;episode_number_or_label&gt;</code>",
-        )
-        return
-
-    if await _ensure_library_config(client, message.chat.id) is None:
         return
 
     series = await database.get_series(series_id)
@@ -2420,17 +2561,43 @@ async def handle_editepisode(client: Client, message: Message) -> None:
         )
         return
 
-    _clear_sessions(message.from_user.id)
+    _clear_sessions(user_id)
     draft = EditEpisodeDraft(
-        user_id=message.from_user.id,
+        user_id=user_id,
         series=series,
         series_id=series_id,
+        stage="episode_pick",
     )
-    _editepisode_sessions[message.from_user.id] = draft
+    _editepisode_sessions[user_id] = draft
+
+    title = html.escape(str(series.get("title") or "Untitled"))
+    if len(args) == 1:
+        reason = (
+            "🎞 <b>Choose an episode to edit</b>\n\n"
+            f"Series: <b>#{series_id} {title}</b>\n\n"
+            "Tap an episode:"
+        )
+        await _send_edit_episode_picker(
+            client, message.chat.id, draft, series["episodes"], reason
+        )
+        return
+
+    query = " ".join(args[1:]).strip()
+    if not query:
+        reason = (
+            "🎞 <b>Choose an episode to edit</b>\n\n"
+            f"Series: <b>#{series_id} {title}</b>\n\n"
+            "Tap an episode:"
+        )
+        await _send_edit_episode_picker(
+            client, message.chat.id, draft, series["episodes"], reason
+        )
+        return
 
     candidates = _resolve_episode_candidates(series, query)
     if len(candidates) == 1:
         draft.episode = candidates[0]
+        draft.stage = "menu"
         await _send_edit_episode_menu(client, message.chat.id, draft)
         return
 
@@ -2718,7 +2885,9 @@ async def _apply_edit_episode(
 
     new_label: Optional[str] = None
     if draft.new_label is not None:
-        new_label, error = _validate_episode_label(draft.new_label)
+        new_label, error = _validate_episode_label_for_series(
+            draft.new_label, series
+        )
         if error:
             await send_message(client, chat_id, error)
             return False
@@ -3037,11 +3206,122 @@ async def handle_edit_episode_callback(
         action = parts[1] if len(parts) > 1 else ""
 
     try:
+        if action == "l" and len(parts) in (3, 4):
+            try:
+                page = int(parts[2])
+                category_index = int(parts[3]) if len(parts) == 4 else -1
+            except ValueError:
+                await query.answer("Invalid page.", show_alert=True)
+                return
+            categories = list(settings.library_channels)
+            category: Optional[str] = None
+            if category_index >= 0:
+                if category_index >= len(categories):
+                    await query.answer(
+                        "That category is no longer configured.",
+                        show_alert=True,
+                    )
+                    return
+                category = categories[category_index]
+            elif category_index < -1:
+                await query.answer("Invalid page.", show_alert=True)
+                return
+            await query.answer()
+            if query.message is not None:
+                await _delete_status(client, chat_id, query.message)
+            await _send_editepisode_series_list(
+                client, chat_id, page=page, category=category
+            )
+            return
+
+        if action == "c" and len(parts) == 4:
+            try:
+                index = int(parts[2])
+                page = int(parts[3])
+            except ValueError:
+                await query.answer(
+                    "Invalid category selection.", show_alert=True
+                )
+                return
+            categories = list(settings.library_channels)
+            if index == -1:
+                category = None
+            elif 0 <= index < len(categories):
+                category = categories[index]
+            else:
+                await query.answer(
+                    "That category is no longer configured.",
+                    show_alert=True,
+                )
+                return
+            await query.answer(
+                "Showing all categories"
+                if category is None
+                else f"Filtering by {category}"
+            )
+            if query.message is not None:
+                await _delete_status(client, chat_id, query.message)
+            await _send_editepisode_series_list(
+                client, chat_id, page=page, category=category
+            )
+            return
+
+        if action == "s" and len(parts) == 3:
+            series_id = int(parts[2])
+            existing = _editepisode_sessions.get(user_id)
+            if existing is not None and (
+                existing.episode is not None
+                or existing.new_label is not None
+                or existing.link_edits
+            ):
+                await query.answer(
+                    "Finish or /cancel the current edit before choosing "
+                    "another series.",
+                    show_alert=True,
+                )
+                return
+            series = await database.get_series(series_id)
+            if series is None:
+                await query.answer(
+                    "That series no longer exists.", show_alert=True
+                )
+                return
+            if not series.get("episodes"):
+                await query.answer(
+                    "That series has no episodes to edit.", show_alert=True
+                )
+                return
+            _clear_sessions(user_id)
+            draft = EditEpisodeDraft(
+                user_id=user_id,
+                series=series,
+                series_id=series_id,
+                stage="episode_pick",
+            )
+            _editepisode_sessions[user_id] = draft
+            await query.answer("Series selected")
+            if query.message is not None:
+                await _delete_status(client, chat_id, query.message)
+            reason = (
+                "🎞 <b>Choose an episode to edit</b>\n\n"
+                f"Series: <b>#{series_id} "
+                f"{html.escape(str(series.get('title') or 'Untitled'))}</b>\n\n"
+                "Tap an episode:"
+            )
+            await _send_edit_episode_picker(
+                client, chat_id, draft, series["episodes"], reason
+            )
+            return
+
         if action == "pick" and len(parts) == 4:
             series_id = int(parts[2])
             episode_id = int(parts[3])
             draft = _editepisode_sessions.get(user_id)
-            if draft is None or draft.series_id != series_id:
+            if (
+                draft is None
+                or draft.series_id != series_id
+                or draft.episode is not None
+            ):
                 await query.answer(
                     "This edit session is no longer active.",
                     show_alert=True,
@@ -3064,6 +3344,8 @@ async def handle_edit_episode_callback(
             draft.episode = episode
             draft.stage = "menu"
             draft.selected_link_id = None
+            draft.new_label = None
+            draft.link_edits.clear()
             await query.answer("Episode selected")
             if query.message is not None:
                 await _delete_status(client, chat_id, query.message)
@@ -3099,8 +3381,10 @@ async def handle_edit_episode_callback(
                 await send_message(
                     client,
                     chat_id,
-                    "✏️ Send the new episode label as text (single line, max "
-                    f"{MAX_LABEL_LENGTH} characters), or use /cancel.",
+                    "✏️ Send the new episode name as text, for example "
+                    "<code>Episode 2</code>.\n\n"
+                    "Single line, max "
+                    f"{MAX_LABEL_LENGTH} characters. Use /cancel to abort.",
                 )
                 return
 
