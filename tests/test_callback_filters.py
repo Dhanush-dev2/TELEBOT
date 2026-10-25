@@ -91,7 +91,7 @@ class CallbackFilterTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(call.args[0])
                     callback_groups.append(call.kwargs.get("group", 0))
 
-        self.assertEqual(len(callback_handlers), 5)
+        self.assertEqual(len(callback_handlers), 6)
         # Pyrogram runs only the first matching handler in a group. These
         # handlers all share ADMIN_CALLBACK, so they must not share a group.
         self.assertEqual(

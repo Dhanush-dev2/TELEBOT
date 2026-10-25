@@ -150,8 +150,8 @@ async def validate_library_channels(
     if not channels:
         logger.warning(
             "LIBRARY_CHANNELS is not configured; /newseries, /addepisode, "
-            "/deletepost, /newpost and /editpost category selection are "
-            "unavailable"
+            "/editepisode, /deletepost, /newpost and /editpost category "
+            "selection are unavailable"
         )
         return {}
 

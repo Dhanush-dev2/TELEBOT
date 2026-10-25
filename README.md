@@ -16,6 +16,8 @@ in a private channel and gives users self-destructing download links.
   inline keyboard has one row per episode with a button per quality.
 - `/addepisode` appends a new episode row to an existing series links post. The
   series library post is not reposted.
+- `/editepisode` fixes an existing episode label or one of its quality links,
+  then re-renders the same series links keyboard.
 - `/migrateposts` is the one-time bridge for posts created by the old
   `/newpost` flow: it reuses existing channel messages, reformats the links
   message into episode rows, and tracks migrated rows in Turso.
@@ -25,9 +27,9 @@ in a private channel and gives users self-destructing download links.
   restarts and redeploys.
 - A built-in aiohttp server answers `GET /` with `OK` on Render's `PORT` so an
   external uptime monitor can keep the free web service awake.
-- `/stats`, `/broadcast`, `/newseries`, `/addepisode`, `/listseries`,
-  `/deletepost`, `/migrateposts`, `/newpost` and `/editpost` admin commands,
-  with FloodWait-aware retries.
+- `/stats`, `/broadcast`, `/newseries`, `/addepisode`, `/editepisode`,
+  `/listseries`, `/deletepost`, `/migrateposts`, `/newpost` and `/editpost`
+  admin commands, with FloodWait-aware retries.
 
 ---
 
@@ -39,8 +41,8 @@ in a private channel and gives users self-destructing download links.
 - A private storage channel where the bot is an administrator
 - Optional: a force-subscribe channel where the bot is an administrator
 - Optional: `LINKS_CHANNEL` and one or more `LIBRARY_CHANNELS` where the bot is
-  an administrator (required for `/newseries`, `/addepisode`, `/listseries`,
-  `/deletepost`, `/migrateposts`, `/newpost` and `/editpost`)
+  an administrator (required for `/newseries`, `/addepisode`, `/editepisode`,
+  `/listseries`, `/deletepost`, `/migrateposts`, `/newpost` and `/editpost`)
 - A VPLink API key
 - A Turso account and database (free tier is enough; see section 3)
 
@@ -125,7 +127,7 @@ Setup steps:
 1. Create the shared `LINKS_CHANNEL` and every category library channel.
 2. Add the bot as an **administrator** in all of them with permission to
    **Post Messages**. Keep these rights for `/newseries`, `/addepisode`,
-   `/migrateposts` and `/editpost`.
+   `/editepisode`, `/migrateposts` and `/editpost`.
 3. Set `LINKS_CHANNEL` and `LIBRARY_CHANNELS` as shown above.
 4. **Cache each new channel's peer before first use:** forward a **text** test
    post (not a media file) from the channel to the bot's private DM, wait until
@@ -179,6 +181,23 @@ On `/done` the bot edits the existing Links Channel message and appends a new
 episode row. The Library Channel post is never touched. The operation is
 rolled back in the database if Telegram rejects the edit.
 
+`/editepisode <series_id> <episode_number_or_label>` fixes an existing episode.
+The second argument can be a 1-based position or the episode's current label.
+If several episodes match, the bot shows a picker. Once an episode is selected,
+the bot shows its label and quality links and accepts:
+
+- `/label <new episode label>` (or the **✏️ Rename episode** button).
+- A replacement video/document whose caption matches an existing quality label,
+  exactly like `/editpost`.
+- `/url <quality_label> <new_url>` to replace the direct link, or
+  `/shorturl <quality_label> <new_url>` to replace the short link.
+- `/qlabel <old_quality_label> <new_quality_label>` to rename a quality.
+- `/done` to apply the staged changes, or `/cancel` to discard them.
+
+On `/done` the bot updates `episodes` / `episode_links` and edits the existing
+Links Channel keyboard. If Telegram rejects the edit, the database change is
+rolled back so the stored episode and the live keyboard stay in sync.
+
 Telegram inline keyboards become unusable when they grow too large. The bot
 stops an append that would push a series past **90 quality buttons** and tells
 the admin to create a manual **Part 2** series with `/newseries` for the
@@ -196,7 +215,8 @@ all of its episodes and quality links in one transaction.
 Legacy `/newpost` creates a single episode-less legacy post. `/editpost` still
 works for legacy posts that have not been migrated. If a legacy post was
 migrated into a series, `/editpost` refuses it with a pointer to
-`/listseries`; use `/addepisode` for new episodes.
+`/listseries`; use `/addepisode` for new episodes and `/editepisode` to fix an
+existing label or quality link.
 
 ### 2.7 VPLink API key
 
@@ -369,8 +389,8 @@ prints a list of problems and exits before connecting to Telegram.
 
 `*` `LINKS_CHANNEL` and at least one library category (`LIBRARY_CHANNELS`, or
 the legacy `LIBRARY_CHANNEL`) are optional for normal file delivery, but are
-required for `/newseries`, `/addepisode`, `/listseries`, `/deletepost`,
-`/migrateposts`, `/newpost` and `/editpost`.
+required for `/newseries`, `/addepisode`, `/editepisode`, `/listseries`,
+`/deletepost`, `/migrateposts`, `/newpost` and `/editpost`.
 `TURSO_AUTH_TOKEN` is required for remote `libsql://` and `https://` URLs; it
 can be empty only when using a local `file:` test database.
 
@@ -449,25 +469,28 @@ PowerShell equivalent: `Invoke-WebRequest http://127.0.0.1:8080/`.
    row and the library channel post is untouched.
 9. Run `/listseries` and verify the category, episode count and both channel
    links are shown.
-10. Test the button cap by adding an episode whose quality count would push the
+10. Run `/editepisode <series_id> <episode>` and verify both a label rename and
+    a quality URL replacement update the existing Links Channel keyboard.
+    Confirm `/cancel` discards staged changes.
+11. Test the button cap by adding an episode whose quality count would push the
     series past 90 buttons: the bot must warn, change nothing, and suggest a
     manual Part 2 series.
-11. Run `/migrateposts status`, then `/migrateposts`. For one old post choose
+12. Run `/migrateposts status`, then `/migrateposts`. For one old post choose
     **➕ New Series** and verify its existing library message is reused and the
     links message gets episode rows. For another choose **📎 Add to Existing
     Series**, edit or accept the label, append it, then confirm or decline the
     old library message deletion.
-12. Re-run `/migrateposts status` and confirm migrated vs pending counts are
+13. Re-run `/migrateposts status` and confirm migrated vs pending counts are
     correct, then confirm a second `/migrateposts` run skips migrated rows.
-13. Legacy fallback: run `/newpost` and `/editpost <post_id>` on an unmigrated
+14. Legacy fallback: run `/newpost` and `/editpost <post_id>` on an unmigrated
     legacy post and verify they still work. Confirm `/editpost` refuses a post
     that was migrated into a series.
-14. Run `/deletepost <id>` for a disposable legacy post or series. Verify the
+15. Run `/deletepost <id>` for a disposable legacy post or series. Verify the
     confirmation names the matched type, cancel once, then confirm and check
     that both channel messages and the database rows are gone.
 
 A fast syntax check and the unit tests (category parsing/validation, callback
-filters, migration state tracking and catalog deletion) are:
+filters, migration state tracking, catalog deletion and episode editing) are:
 
 ```bash
 python -m compileall -q bot.py config.py database.py handlers utils tests
@@ -508,7 +531,7 @@ re-registers every unfinished row, scheduling already-expired deletions one
 second in the future. This makes auto-delete jobs survive Render restarts and
 redeploys without a second database or a local scheduler file.
 
-### Series post flow (`/newseries`, `/addepisode`)
+### Series post flow (`/newseries`, `/addepisode`, `/editepisode`)
 
 Series metadata lives in three additive Turso tables; the legacy
 `library_posts` / `library_post_qualities` tables are untouched except for the
@@ -549,6 +572,15 @@ refuses an append that would exceed **90 quality buttons** for one series,
 changes nothing, and recommends a manual **Part 2** series with `/newseries`.
 This avoids a silently truncated or rejected Telegram keyboard.
 
+`/editepisode <series_id> <episode_number_or_label>` resolves the series and
+then the episode by 1-based position or current label. If several episodes
+match, it shows a picker. The session stages changes in memory until `/done`:
+label renames, URL replacements (`/url`, `/shorturl`), quality-label renames
+(`/qlabel`) and replacement files whose captions match an existing quality
+label. `/cancel` discards the staged changes. On `/done` the bot updates the
+`episodes` / `episode_links` rows and edits the existing Links Channel keyboard;
+if that Telegram edit fails, it restores the old database values.
+
 `/listseries` renders every series with its category, episode count,
 quality-link count and Library/Links channel message links. Message links are
 built from the configured category and shared links channels, so a channel that
@@ -569,8 +601,9 @@ quality labels, plus two choices:
   row. The old post is marked migrated only after the edit succeeds; a failed
   edit rolls back the series row.
 - **📎 Add to Existing Series**: shows a paged list of series. After picking one,
-  the bot proposes the old post's first title line as the episode label; the
-  admin can accept it or send a different label. On confirmation the bot appends
+  the bot proposes the next `Episode N` label; the admin can accept it or send a
+  different label. The legacy post title and prompt text are never used as the
+  default label. On confirmation the bot appends
   the old post's quality links as a new episode row, edits the series Links
   Channel message, and marks the old post migrated. It then asks for explicit
   confirmation before deleting the old standalone Library Channel message. If
@@ -619,8 +652,9 @@ cannot be deleted, the bot reports it so an admin can remove it manually.
 
 `/editpost` refuses posts that were migrated into a series. Their layout is now
 owned by the series Links Channel message; use `/listseries` to find the series
-and `/addepisode` for new episodes. Editing the file of an already-migrated
-episode is not supported by the legacy command.
+and `/addepisode` for new episodes. Use `/editepisode` to fix an existing
+episode label or quality link. Editing the file of an already-migrated episode
+is not supported by the legacy command.
 
 ### Admin commands
 
@@ -631,6 +665,7 @@ episode is not supported by the legacy command.
 | `/broadcast <text>` | Send plain text to every known user |
 | `/newseries` | Create one series with Episode 1 and both channel posts |
 | `/addepisode [category]` | Append an episode row to an existing series Links Channel post |
+| `/editepisode <series_id> <episode>` | Rename an episode or replace its quality links |
 | `/listseries` | Show series, categories, episode counts and channel links |
 | `/deletepost <id>` | Delete a legacy post or series and its channel messages |
 | `/migrateposts` | Interactive one-time migration of legacy posts |
@@ -638,7 +673,7 @@ episode is not supported by the legacy command.
 | `/migrateposts status` | Report migrated vs pending legacy posts only |
 | `/newpost` | Legacy guided thumbnail + caption + category + quality-file post |
 | `/editpost <post_id>` | Legacy: replace one quality file or move the post |
-| `/cancel` | Abort an active series, migration, `/newpost` or `/editpost` draft |
+| `/cancel` | Abort an active series, episode-edit, migration, `/newpost` or `/editpost` draft |
 
 Broadcasts send with a 50 ms delay and respect `FloodWait` by sleeping and
 retrying. Users who blocked the bot are counted as failed and skipped.
@@ -823,7 +858,7 @@ telebot/
 ├── handlers/
 │   ├── __init__.py
 │   ├── admin.py                # upload handling, /stats, /broadcast
-│   ├── library.py              # /newseries, /addepisode, /listseries, /deletepost, /migrateposts, legacy /newpost, /editpost
+│   ├── library.py              # /newseries, /addepisode, /editepisode, /listseries, /deletepost, /migrateposts, legacy /newpost, /editpost
 │   └── user.py                 # /start, force-sub gate, delivery, user logging
 ├── utils/
 │   ├── __init__.py
@@ -863,7 +898,7 @@ telebot/
 - Use the numeric `-100...` ID (not the invite link or channel title).
 - If using `@username`, the channel must be public.
 
-**`/newseries`, `/addepisode` or `/newpost` says library posting is not configured**
+**`/newseries`, `/addepisode`, `/editepisode` or `/newpost` says library posting is not configured**
 
 - Set `LINKS_CHANNEL` and `LIBRARY_CHANNELS` in `.env`, then restart.
 - The old `LIBRARY_CHANNEL` setting still works as category `default`, but
@@ -881,13 +916,14 @@ telebot/
   the bot's private DM once to cache its peer/access hash, then retry.
 - Other categories remain usable even if one category is broken.
 
-**`/newseries`, `/addepisode`, `/migrateposts` or `/editpost` says the bot is not an administrator**
+**`/newseries`, `/addepisode`, `/editepisode`, `/migrateposts` or `/editpost` says the bot is not an administrator**
 
 - Add the bot as an administrator in the shared `LINKS_CHANNEL` and every
   category channel you use.
 - Grant **Post Messages** in all of them.
-- `/addepisode` and the migration flows must be able to edit the stored
-  `LINKS_CHANNEL` message; deleting that message makes appending impossible.
+- `/addepisode`, `/editepisode` and the migration flows must be able to edit
+  the stored `LINKS_CHANNEL` message; deleting that message makes appending or
+  editing impossible.
 - `/editpost` must be able to delete the old library message when moving a
   post to another category.
 
@@ -922,7 +958,8 @@ telebot/
 
 - That post was merged into the series layout. Its links message is now owned
   by the series and must keep episode rows.
-- Use `/listseries` to find the series. Use `/addepisode` for new episodes.
+- Use `/listseries` to find the series. Use `/addepisode` for new episodes and
+  `/editepisode` to rename an episode or replace one of its quality links.
 - Replacing a file inside an already-migrated episode is not supported by
   `/editpost`.
 

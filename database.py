@@ -663,6 +663,53 @@ async def add_episode(
     return int(results[0].rows[0]["id"])
 
 
+async def update_episode_details(
+    episode_id: int,
+    episode_label: Optional[str],
+    links: list[dict],
+) -> bool:
+    """Update one episode label and its selected quality links atomically.
+
+    ``episode_label`` is only written when it is not ``None``. ``links`` items
+    must contain ``id``, ``quality_label``, ``short_url`` and ``direct_link``.
+    Callers should validate the link IDs against the current episode before
+    calling; this helper returns ``False`` only when the episode itself no
+    longer exists.
+    """
+    statements: list[tuple[str, tuple]] = [
+        ("SELECT id FROM episodes WHERE id = ?", (episode_id,)),
+    ]
+    if episode_label is not None:
+        statements.append(
+            (
+                "UPDATE episodes SET episode_label = ? WHERE id = ?",
+                (episode_label, episode_id),
+            )
+        )
+    for link in links:
+        statements.append(
+            (
+                """
+                UPDATE episode_links
+                SET quality_label = ?, short_url = ?, direct_link = ?
+                WHERE id = ? AND episode_id = ?
+                """,
+                (
+                    link["quality_label"],
+                    link.get("short_url"),
+                    link["direct_link"],
+                    int(link["id"]),
+                    episode_id,
+                ),
+            )
+        )
+
+    results = await _get_client().batch(statements)
+    if len(results) < len(statements) or not results[0].rows:
+        return False
+    return True
+
+
 async def get_series(series_id: int) -> Optional[dict]:
     """Return a series with its episodes and each episode's quality links."""
     result = await _get_client().execute(

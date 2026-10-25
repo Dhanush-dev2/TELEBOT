@@ -1,7 +1,8 @@
 """Admin library workflow.
 
-Series commands: /newseries, /addepisode, /listseries, /deletepost and the
-one-time /migrateposts bridge. Legacy commands: /newpost and /editpost.
+Series commands: /newseries, /addepisode, /editepisode, /listseries,
+/deletepost and the one-time /migrateposts bridge. Legacy commands: /newpost
+and /editpost.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ MAX_LABEL_LENGTH = 64
 MAX_LINKS_BUTTONS = 90
 MAX_BUTTON_TEXT_LENGTH = 60
 MAX_SERIES_TITLE_LENGTH = 120
+MAX_URL_LENGTH = 2048
+MAX_MESSAGE_TEXT_LENGTH = 4000
 SERIES_PAGE_SIZE = 8
 
 _MANAGEMENT_COMMANDS = {
@@ -54,6 +57,7 @@ _MANAGEMENT_COMMANDS = {
     "editpost",
     "newseries",
     "addepisode",
+    "editepisode",
     "listseries",
     "migrateposts",
     "deletepost",
@@ -110,7 +114,37 @@ class MigrateDraft:
     stage: str = "review"
     series_id: Optional[int] = None
     episode_label: Optional[str] = None
+    episode_label_customized: bool = False
     series_page: int = 0
+
+
+@dataclass
+class EpisodeLinkEdit:
+    """One staged quality-link change for /editepisode."""
+
+    link_id: int
+    quality_label: str
+    new_quality_label: Optional[str] = None
+    direct_link: Optional[str] = None
+    short_link: Optional[str] = None
+    short_link_set: bool = False
+    file_chat_id: Optional[int] = None
+    file_message_id: Optional[int] = None
+    file_type: Optional[str] = None
+
+
+@dataclass
+class EditEpisodeDraft:
+    """Staged label/link changes for one /editepisode session."""
+
+    user_id: int
+    series: dict
+    series_id: int
+    episode: Optional[dict] = None
+    stage: str = "menu"
+    new_label: Optional[str] = None
+    link_edits: dict[int, EpisodeLinkEdit] = field(default_factory=dict)
+    selected_link_id: Optional[int] = None
 
 
 @dataclass
@@ -142,13 +176,15 @@ _newpost_sessions: dict[int, NewPostDraft] = {}
 _editpost_sessions: dict[int, EditPostDraft] = {}
 _series_sessions: dict[int, SeriesDraft] = {}
 _migrate_sessions: dict[int, MigrateDraft] = {}
+_editepisode_sessions: dict[int, EditEpisodeDraft] = {}
 _deletepost_sessions: dict[int, DeletePostDraft] = {}
 
 
 def _command_name(message: Message) -> Optional[str]:
-    if not message.text or not message.text.startswith("/"):
+    text = getattr(message, "text", None)
+    if not text or not text.startswith("/"):
         return None
-    command = message.text.split(maxsplit=1)[0][1:]
+    command = text.split(maxsplit=1)[0][1:]
     return command.split("@", 1)[0].lower()
 
 
@@ -160,6 +196,7 @@ def _has_session(_, __, message: Message) -> bool:
         user_id in _newpost_sessions
         or user_id in _editpost_sessions
         or user_id in _series_sessions
+        or user_id in _editepisode_sessions
         or user_id in _migrate_sessions
     )
 
@@ -172,6 +209,7 @@ def _clear_sessions(user_id: int) -> None:
     _newpost_sessions.pop(user_id, None)
     _editpost_sessions.pop(user_id, None)
     _series_sessions.pop(user_id, None)
+    _editepisode_sessions.pop(user_id, None)
     _migrate_sessions.pop(user_id, None)
     _deletepost_sessions.pop(user_id, None)
 
@@ -376,9 +414,11 @@ async def handle_editpost(client: Client, message: Message) -> None:
             f"⚠️ Library post <code>{post_id}</code> was migrated into the "
             "series layout.\n\n"
             "<code>/editpost</code> only manages unmigrated legacy posts now. "
-            "Use <code>/listseries</code> to find the series and "
-            "<code>/addepisode</code> for new episodes. Replacing the file of "
-            "a migrated episode is not supported by this command.",
+            "Use <code>/listseries</code> to find the series, "
+            "<code>/addepisode</code> for new episodes and "
+            "<code>/editepisode</code> to fix an existing label or quality "
+            "link. Replacing the file of a migrated episode is not supported "
+            "by this command.",
         )
         return
 
@@ -443,6 +483,8 @@ async def handle_cancel(client: Client, message: Message) -> None:
         cancelled = _series_sessions.pop(message.from_user.id, None)
     if cancelled is None:
         cancelled = _migrate_sessions.pop(message.from_user.id, None)
+    if cancelled is None:
+        cancelled = _editepisode_sessions.pop(message.from_user.id, None)
 
     if cancelled is not None:
         await send_message(
@@ -470,6 +512,15 @@ async def handle_session_message(client: Client, message: Message) -> None:
     edit_draft = _editpost_sessions.get(user_id)
     if edit_draft is not None:
         await _handle_editpost_message(client, message, edit_draft)
+        return
+
+    edit_episode_draft = _editepisode_sessions.get(user_id)
+    if edit_episode_draft is not None:
+        if command in _MANAGEMENT_COMMANDS:
+            return
+        await _handle_editepisode_message(
+            client, message, edit_episode_draft
+        )
         return
 
     series_draft = _series_sessions.get(user_id)
@@ -1279,7 +1330,7 @@ async def _handle_editpost_message(
 
 
 # ---------------------------------------------------------------------------
-# Series workflows (/newseries, /addepisode, /listseries)
+# Series workflows (/newseries, /addepisode, /editepisode, /listseries)
 # ---------------------------------------------------------------------------
 
 
@@ -1295,10 +1346,24 @@ def _derive_title(caption: str) -> str:
     return "Untitled series"
 
 
+def _is_placeholder_episode_label(label: str) -> bool:
+    """Return True for the /migrateposts prompt text, never a real label."""
+    normalized = " ".join(label.casefold().split()).strip(" .:;,…")
+    return normalized.startswith(
+        ("new episode label", "send the new episode label")
+    )
+
+
 def _validate_episode_label(raw: str) -> tuple[Optional[str], Optional[str]]:
     label = raw.strip()
     if not label:
         return None, "❌ The episode label cannot be empty."
+    if _is_placeholder_episode_label(label):
+        return (
+            None,
+            "❌ That is the prompt text, not an episode label. Send a real "
+            "label such as <code>Episode 2</code>.",
+        )
     if len(label) > MAX_LABEL_LENGTH or "\n" in label or "\r" in label:
         return (
             None,
@@ -1306,6 +1371,39 @@ def _validate_episode_label(raw: str) -> tuple[Optional[str], Optional[str]]:
             f"{MAX_LABEL_LENGTH} characters.",
         )
     return label, None
+
+
+def _validate_quality_text(raw: str) -> tuple[Optional[str], Optional[str]]:
+    label = raw.strip()
+    if not label:
+        return None, "❌ The quality label cannot be empty."
+    if len(label) > MAX_LABEL_LENGTH or "\n" in label or "\r" in label:
+        return (
+            None,
+            f"❌ Quality labels must be a single line, at most "
+            f"{MAX_LABEL_LENGTH} characters.",
+        )
+    return label, None
+
+
+def _validate_link_url(raw: str) -> tuple[Optional[str], Optional[str]]:
+    url = raw.strip()
+    if not url:
+        return None, "❌ The URL cannot be empty."
+    if len(url) > MAX_URL_LENGTH:
+        return (
+            None,
+            f"❌ URLs must be at most {MAX_URL_LENGTH} characters.",
+        )
+    if any(character.isspace() for character in url):
+        return None, "❌ The URL must not contain spaces."
+    if not url.startswith(("https://", "http://", "tg://")):
+        return (
+            None,
+            "❌ Send a full URL starting with <code>https://</code>, "
+            "<code>http://</code> or <code>tg://</code>.",
+        )
+    return url, None
 
 
 def _validate_quality_label(
@@ -1393,25 +1491,40 @@ def _button_limit_text(series: dict, extra_buttons: int) -> str:
 
 
 def _next_episode_label(series: dict) -> str:
-    count = int(series.get("episode_count") or 0)
+    raw_count = series.get("episode_count")
+    if raw_count is None:
+        count = len(series.get("episodes", []))
+    else:
+        count = int(raw_count or 0)
     return f"Episode {count + 1}"
 
 
-def _default_label_from_post(post: dict) -> str:
-    title = (post.get("title") or "").strip()
-    first_line = title.splitlines()[0].strip() if title else ""
-    if not first_line:
-        return "Episode 1"
-    return first_line[:MAX_LABEL_LENGTH]
+def _migration_episode_label(
+    raw: Optional[str],
+    series: dict,
+    *,
+    customized: bool = False,
+) -> str:
+    """Return a safe migration label, ignoring prompt/title defaults.
+
+    Only an explicitly edited, valid label is accepted. The legacy post title
+    and the prompt text are never used as the default episode label.
+    """
+    if customized and raw:
+        label, error = _validate_episode_label(raw)
+        if label is not None and error is None:
+            return label
+    return _next_episode_label(series)
 
 
 def _message_link(chat: Optional[Chat], message_id: Optional[int]) -> Optional[str]:
     """Build a t.me link for a stored message without fetching it."""
     if chat is None or not message_id:
         return None
-    if chat.username:
-        return f"https://t.me/{chat.username}/{int(message_id)}"
-    raw_id = str(chat.id)
+    username = getattr(chat, "username", None)
+    if username:
+        return f"https://t.me/{username}/{int(message_id)}"
+    raw_id = str(getattr(chat, "id", ""))
     if raw_id.startswith("-100"):
         return f"https://t.me/c/{raw_id[4:]}/{int(message_id)}"
     return None
@@ -1683,6 +1796,8 @@ async def handle_listseries(client: Client, message: Message) -> None:
         text = (
             "📺 <b>No series yet.</b>\n\n"
             "Create your first series with /newseries.\n\n"
+            "✏️ Use <code>/editepisode &lt;series_id&gt; "
+            "&lt;episode&gt;</code> to fix an episode label or quality link.\n"
             "🗑 Use <code>/deletepost &lt;id&gt;</code> to remove a legacy "
             "post or series."
         )
@@ -1765,12 +1880,1234 @@ async def handle_listseries(client: Client, message: Message) -> None:
             "waiting for /migrateposts.\n\n"
         )
     chunk += (
+        "✏️ Use <code>/editepisode &lt;series_id&gt; &lt;episode&gt;</code> "
+        "to fix an episode label or quality link.\n"
         "🗑 Use <code>/deletepost &lt;id&gt;</code> to delete a series or "
         "legacy post."
     )
     await send_message(
         client, message.chat.id, chunk, disable_web_page_preview=True
     )
+
+
+# ---------------------------------------------------------------------------
+# Episode editing (/editepisode)
+# ---------------------------------------------------------------------------
+
+
+def _find_episode(series: dict, episode_id: int) -> Optional[dict]:
+    for episode in series.get("episodes", []):
+        if int(episode.get("id") or 0) == int(episode_id):
+            return episode
+    return None
+
+
+def _episode_position(series: dict, episode_id: int) -> int:
+    for position, episode in enumerate(series.get("episodes", []), start=1):
+        if int(episode.get("id") or 0) == int(episode_id):
+            return position
+    return 0
+
+
+def _find_episode_link(episode: dict, link_id: int) -> Optional[dict]:
+    for link in episode.get("links", []):
+        if int(link.get("id") or 0) == int(link_id):
+            return link
+    return None
+
+
+def _match_episode_quality(episode: dict, label: str) -> Optional[dict]:
+    target = label.strip().casefold()
+    for link in episode.get("links", []):
+        if (
+            str(link.get("quality_label") or "").strip().casefold()
+            == target
+        ):
+            return link
+    return None
+
+
+def _match_quality_for_draft(
+    draft: EditEpisodeDraft, label: str
+) -> Optional[dict]:
+    """Match a current quality label or a staged replacement label."""
+    if draft.episode is None:
+        return None
+    link = _match_episode_quality(draft.episode, label)
+    if link is not None:
+        return link
+
+    target = label.strip().casefold()
+    for candidate in draft.episode.get("links", []):
+        edit = draft.link_edits.get(int(candidate["id"]))
+        if (
+            edit is not None
+            and edit.new_quality_label
+            and edit.new_quality_label.strip().casefold() == target
+        ):
+            return candidate
+    return None
+
+
+def _resolve_episode_candidates(series: dict, query: str) -> list[dict]:
+    """Resolve an episode by 1-based position or exact current label."""
+    raw = query.strip()
+    if not raw:
+        return []
+
+    episodes = series.get("episodes", [])
+    matches: list[dict] = []
+    seen: set[int] = set()
+
+    def add(episode: dict) -> None:
+        episode_id = int(episode.get("id") or 0)
+        if episode_id and episode_id not in seen:
+            seen.add(episode_id)
+            matches.append(episode)
+
+    if raw.isdigit():
+        position = int(raw)
+        if 1 <= position <= len(episodes):
+            add(episodes[position - 1])
+
+    target = raw.casefold()
+    for episode in episodes:
+        if str(episode.get("episode_label") or "").strip().casefold() == target:
+            add(episode)
+    return matches
+
+
+def _clip(value: str, limit: int = 140) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _episode_link_detail(link: dict) -> str:
+    short = str(link.get("short_url") or "").strip()
+    direct = str(link.get("direct_link") or "").strip()
+    if short and direct and short != direct:
+        return (
+            f"short: {html.escape(_clip(short))} | "
+            f"direct: {html.escape(_clip(direct))}"
+        )
+    return html.escape(_clip(short or direct or "—"))
+
+
+def _edit_episode_menu_text(draft: EditEpisodeDraft) -> str:
+    series = draft.series
+    episode = draft.episode or {}
+    episode_id = int(episode.get("id") or 0)
+    position = _episode_position(series, episode_id)
+    lines = [
+        "✏️ <b>Edit episode</b>",
+        "",
+        f"📺 <b>Series:</b> #{series.get('id')} "
+        f"{html.escape(str(series.get('title') or 'Untitled'))}",
+        f"🎞 <b>Episode:</b> "
+        f"{html.escape(str(episode.get('episode_label') or 'Episode'))} "
+        f"(position {position})",
+        "",
+        "<b>Current quality links:</b>",
+    ]
+
+    links = episode.get("links", [])
+    for link in links[:6]:
+        lines.append(
+            f"• <b>{html.escape(str(link.get('quality_label') or 'Link'))}"
+            f"</b> — {_episode_link_detail(link)}"
+        )
+    if not links:
+        lines.append("• <i>none</i>")
+    elif len(links) > 6:
+        lines.append(
+            f"• …and {len(links) - 6} more (use the quality buttons)."
+        )
+
+    pending: list[str] = []
+    if draft.new_label is not None:
+        pending.append(
+            f"🏷 Episode label → <b>{html.escape(draft.new_label)}</b>"
+        )
+    for edit in list(draft.link_edits.values())[:6]:
+        parts: list[str] = []
+        if edit.new_quality_label:
+            parts.append(f"label → {html.escape(edit.new_quality_label)}")
+        if edit.file_message_id is not None:
+            parts.append("replacement file queued")
+        else:
+            if edit.direct_link:
+                parts.append(f"direct → {html.escape(_clip(edit.direct_link))}")
+            if edit.short_link_set:
+                parts.append(
+                    "short → "
+                    + html.escape(_clip(edit.short_link or "(cleared)"))
+                )
+        if parts:
+            pending.append(
+                f"🔗 <b>{html.escape(edit.quality_label)}</b>: "
+                + " · ".join(parts)
+            )
+    if len(draft.link_edits) > 6:
+        pending.append(
+            f"…and {len(draft.link_edits) - 6} more quality change(s)."
+        )
+    if pending:
+        lines += ["", "<b>Pending changes:</b>", *pending]
+
+    lines += [
+        "",
+        "Tap a quality button to edit it, or:",
+        "• Send a video/document whose caption matches an existing quality "
+        "label to replace that file.",
+        "• Send <code>/url &lt;quality_label&gt; &lt;new_url&gt;</code> to "
+        "replace a direct link.",
+        "• Send <code>/shorturl &lt;quality_label&gt; &lt;new_url&gt;</code> "
+        "to replace a short link.",
+        "• Send <code>/qlabel &lt;old_quality_label&gt; "
+        "&lt;new_quality_label&gt;</code> to rename a quality.",
+        "• Send <code>/label &lt;new episode label&gt;</code> or tap "
+        "✏️ Rename episode.",
+        "• <code>/done</code> to apply, <code>/cancel</code> to abort.",
+    ]
+    text = "\n".join(lines)
+    if len(text) > MAX_MESSAGE_TEXT_LENGTH:
+        text = text[:MAX_MESSAGE_TEXT_LENGTH].rsplit("\n", 1)[0]
+        text += "\n… (shortened)"
+    return text
+
+
+def _edit_episode_keyboard(draft: EditEpisodeDraft) -> InlineKeyboardMarkup:
+    episode = draft.episode or {}
+    series_id = int(draft.series_id)
+    episode_id = int(episode.get("id") or 0)
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                "✏️ Rename episode",
+                callback_data=f"edep:rename:{series_id}:{episode_id}",
+            )
+        ]
+    ]
+    for link in episode.get("links", []):
+        label = str(link.get("quality_label") or "Link")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🔗 {label}"[:MAX_BUTTON_TEXT_LENGTH],
+                    callback_data=(
+                        f"edep:q:{series_id}:{episode_id}:{int(link['id'])}"
+                    ),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✅ Apply changes",
+                callback_data=f"edep:done:{series_id}:{episode_id}",
+            ),
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data=f"edep:cancel:{series_id}:{episode_id}",
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_edit_episode_menu(
+    client: Client, chat_id: int, draft: EditEpisodeDraft
+) -> None:
+    if draft.episode is None:
+        return
+    await send_message(
+        client,
+        chat_id,
+        _edit_episode_menu_text(draft),
+        reply_markup=_edit_episode_keyboard(draft),
+        disable_web_page_preview=True,
+    )
+
+
+async def _send_edit_episode_picker(
+    client: Client,
+    chat_id: int,
+    draft: EditEpisodeDraft,
+    candidates: list[dict],
+    reason: str,
+) -> None:
+    rows = []
+    for episode in candidates:
+        position = _episode_position(draft.series, int(episode["id"]))
+        label = (
+            f"#{position} "
+            f"{episode.get('episode_label') or 'Episode'}"
+        )[:MAX_BUTTON_TEXT_LENGTH]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=(
+                        f"edep:pick:{draft.series_id}:{episode['id']}"
+                    ),
+                )
+            ]
+        )
+    await send_message(
+        client,
+        chat_id,
+        reason,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _send_edit_episode_quality_picker(
+    client: Client, chat_id: int, draft: EditEpisodeDraft
+) -> None:
+    if draft.episode is None:
+        return
+    links = draft.episode.get("links", [])
+    if not links:
+        await send_message(
+            client,
+            chat_id,
+            "❌ This episode has no quality links to edit. Use /label to "
+            "rename the episode, or /cancel.",
+        )
+        return
+
+    rows = []
+    for link in links:
+        label = str(link.get("quality_label") or "Link")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🔗 {label}"[:MAX_BUTTON_TEXT_LENGTH],
+                    callback_data=(
+                        f"edep:q:{draft.series_id}:"
+                        f"{int(draft.episode['id'])}:{int(link['id'])}"
+                    ),
+                )
+            ]
+        )
+    await send_message(
+        client,
+        chat_id,
+        f"🔗 Choose a quality to edit for "
+        f"<b>{html.escape(str(draft.episode.get('episode_label') or 'Episode'))}"
+        "</b>:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _send_edit_episode_quality_prompt(
+    client: Client, chat_id: int, draft: EditEpisodeDraft, link: dict
+) -> None:
+    short = str(link.get("short_url") or "").strip()
+    direct = str(link.get("direct_link") or "").strip()
+    await send_message(
+        client,
+        chat_id,
+        f"🔗 <b>Editing quality:</b> "
+        f"{html.escape(str(link.get('quality_label') or 'Link'))}\n\n"
+        f"Short link: {html.escape(_clip(short)) if short else '<i>none</i>'}\n"
+        f"Direct link: "
+        f"{html.escape(_clip(direct)) if direct else '<i>none</i>'}\n\n"
+        "Send a video/document with this quality label as its caption to "
+        "replace the file.\n"
+        "Or send <code>/url &lt;new_url&gt;</code> for the direct link, "
+        "<code>/shorturl &lt;new_url&gt;</code> for the short link, or "
+        "<code>/qlabel &lt;new_quality_label&gt;</code> to rename it.\n\n"
+        "Use <code>/done</code> to apply or <code>/cancel</code> to abort.",
+        disable_web_page_preview=True,
+    )
+
+
+def _get_or_create_link_edit(
+    draft: EditEpisodeDraft, link: dict
+) -> EpisodeLinkEdit:
+    link_id = int(link["id"])
+    edit = draft.link_edits.get(link_id)
+    if edit is None:
+        edit = EpisodeLinkEdit(
+            link_id=link_id,
+            quality_label=str(link.get("quality_label") or "Link"),
+        )
+        draft.link_edits[link_id] = edit
+    return edit
+
+
+async def _stage_episode_label(
+    client: Client, chat_id: int, draft: EditEpisodeDraft, raw: str
+) -> None:
+    label, error = _validate_episode_label(raw)
+    if error:
+        await send_message(client, chat_id, error)
+        return
+    draft.new_label = label
+    draft.stage = "menu"
+    await send_message(
+        client,
+        chat_id,
+        f"✅ Episode label queued: <b>{html.escape(label)}</b>",
+    )
+    await _send_edit_episode_menu(client, chat_id, draft)
+
+
+async def _stage_quality_url(
+    client: Client,
+    chat_id: int,
+    draft: EditEpisodeDraft,
+    link: dict,
+    raw_url: str,
+    *,
+    short: bool,
+) -> None:
+    url, error = _validate_link_url(raw_url)
+    if error:
+        await send_message(client, chat_id, error)
+        return
+    edit = _get_or_create_link_edit(draft, link)
+    edit.file_chat_id = None
+    edit.file_message_id = None
+    edit.file_type = None
+    if short:
+        edit.short_link = url
+        edit.short_link_set = True
+    else:
+        edit.direct_link = url
+        edit.short_link = None
+        edit.short_link_set = True
+    draft.selected_link_id = int(link["id"])
+    draft.stage = "menu"
+    await send_message(
+        client,
+        chat_id,
+        f"✅ Queued {'short' if short else 'direct'} link for "
+        f"<b>{html.escape(str(link.get('quality_label') or 'Link'))}</b>: "
+        f"{html.escape(url)}",
+    )
+    await _send_edit_episode_menu(client, chat_id, draft)
+
+
+async def _stage_quality_label(
+    client: Client,
+    chat_id: int,
+    draft: EditEpisodeDraft,
+    link: dict,
+    raw: str,
+) -> None:
+    label, error = _validate_quality_text(raw)
+    if error:
+        await send_message(client, chat_id, error)
+        return
+    edit = _get_or_create_link_edit(draft, link)
+    edit.new_quality_label = label
+    draft.selected_link_id = int(link["id"])
+    draft.stage = "menu"
+    await send_message(
+        client,
+        chat_id,
+        f"✅ Quality label queued: "
+        f"<b>{html.escape(str(link.get('quality_label') or 'Link'))}</b> → "
+        f"<b>{html.escape(label)}</b>",
+    )
+    await _send_edit_episode_menu(client, chat_id, draft)
+
+
+async def _stage_quality_file(
+    client: Client, message: Message, draft: EditEpisodeDraft
+) -> None:
+    if draft.episode is None:
+        return
+    caption = (getattr(message, "caption", None) or "").strip()
+    if not caption:
+        await send_message(
+            client,
+            message.chat.id,
+            "❌ Add the existing quality label as the file caption, for "
+            "example <code>1080p</code>.",
+        )
+        return
+
+    link = _match_quality_for_draft(draft, caption)
+    if link is None:
+        labels = ", ".join(
+            f"<code>{html.escape(str(item.get('quality_label') or '?'))}</code>"
+            for item in draft.episode.get("links", [])
+        ) or "<i>none</i>"
+        await send_message(
+            client,
+            message.chat.id,
+            f"❌ No quality labelled <b>{html.escape(caption)}</b> exists "
+            f"for this episode.\n\nExisting qualities: {labels}",
+        )
+        return
+
+    edit = _get_or_create_link_edit(draft, link)
+    edit.file_chat_id = message.chat.id
+    edit.file_message_id = message.id
+    edit.file_type = (
+        "video" if getattr(message, "video", None) else "document"
+    )
+    edit.direct_link = None
+    edit.short_link = None
+    edit.short_link_set = False
+    draft.selected_link_id = int(link["id"])
+    draft.stage = "menu"
+    await send_message(
+        client,
+        message.chat.id,
+        f"✅ Replacement file queued for "
+        f"<b>{html.escape(str(link.get('quality_label') or 'Link'))}</b>.",
+    )
+    await _send_edit_episode_menu(client, message.chat.id, draft)
+
+
+async def handle_editepisode(client: Client, message: Message) -> None:
+    """Start an /editepisode <series_id> <episode> session."""
+    if message.from_user is None:
+        return
+
+    args = message.command[1:] if message.command else []
+    if len(args) < 2:
+        await send_message(
+            client,
+            message.chat.id,
+            "Usage: <code>/editepisode &lt;series_id&gt; "
+            "&lt;episode_number_or_label&gt;</code>\n\n"
+            "Examples:\n"
+            "• <code>/editepisode 3 2</code>\n"
+            "• <code>/editepisode 3 Episode 2</code>\n\n"
+            "Use /listseries to find the series ID.",
+        )
+        return
+
+    try:
+        series_id = int(args[0])
+    except ValueError:
+        await send_message(
+            client,
+            message.chat.id,
+            "❌ The series ID must be a number.",
+        )
+        return
+
+    query = " ".join(args[1:]).strip()
+    if not query:
+        await send_message(
+            client,
+            message.chat.id,
+            "Usage: <code>/editepisode &lt;series_id&gt; "
+            "&lt;episode_number_or_label&gt;</code>",
+        )
+        return
+
+    if await _ensure_library_config(client, message.chat.id) is None:
+        return
+
+    series = await database.get_series(series_id)
+    if series is None:
+        await send_message(
+            client,
+            message.chat.id,
+            f"❌ Series <code>{series_id}</code> was not found.",
+        )
+        return
+    if not series.get("episodes"):
+        await send_message(
+            client,
+            message.chat.id,
+            f"❌ Series <code>{series_id}</code> has no episodes to edit.",
+        )
+        return
+
+    _clear_sessions(message.from_user.id)
+    draft = EditEpisodeDraft(
+        user_id=message.from_user.id,
+        series=series,
+        series_id=series_id,
+    )
+    _editepisode_sessions[message.from_user.id] = draft
+
+    candidates = _resolve_episode_candidates(series, query)
+    if len(candidates) == 1:
+        draft.episode = candidates[0]
+        await _send_edit_episode_menu(client, message.chat.id, draft)
+        return
+
+    if candidates:
+        reason = (
+            "❓ <b>Multiple episodes match.</b>\n\n"
+            f"Query: <code>{html.escape(query)}</code>\n"
+            "Choose the exact episode:"
+        )
+        await _send_edit_episode_picker(
+            client, message.chat.id, draft, candidates, reason
+        )
+        return
+
+    reason = (
+        "❌ <b>No episode matched.</b>\n\n"
+        f"Query: <code>{html.escape(query)}</code>\n"
+        "Choose an episode:"
+    )
+    await _send_edit_episode_picker(
+        client, message.chat.id, draft, series.get("episodes", []), reason
+    )
+
+
+async def _handle_editepisode_message(
+    client: Client, message: Message, draft: EditEpisodeDraft
+) -> None:
+    command = _command_name(message)
+
+    if command == "done":
+        await _finish_edit_episode(client, message.chat.id, draft)
+        return
+
+    if draft.episode is None:
+        await send_message(
+            client,
+            message.chat.id,
+            "Choose an episode using the buttons above, or /cancel.",
+        )
+        return
+
+    if command == "label":
+        raw = " ".join(message.command[1:]).strip() if message.command else ""
+        await _stage_episode_label(client, message.chat.id, draft, raw)
+        return
+
+    if command in {"url", "shorturl"}:
+        args = message.command[1:] if message.command else []
+        link: Optional[dict] = None
+        raw_url = ""
+        if len(args) >= 2:
+            link = _match_quality_for_draft(draft, args[0])
+            raw_url = " ".join(args[1:]).strip()
+            if link is None:
+                await send_message(
+                    client,
+                    message.chat.id,
+                    f"❌ No quality labelled <b>{html.escape(args[0])}</b> "
+                    "exists for this episode.",
+                )
+                return
+        elif len(args) == 1 and draft.selected_link_id is not None:
+            link = _find_episode_link(
+                draft.episode, draft.selected_link_id
+            )
+            raw_url = args[0].strip()
+        if link is None:
+            await send_message(
+                client,
+                message.chat.id,
+                "Usage: <code>/url &lt;quality_label&gt; &lt;new_url&gt;</code>"
+                " or <code>/shorturl &lt;quality_label&gt; "
+                "&lt;new_url&gt;</code>\n\n"
+                "Tap a quality button first to use the one-argument form.",
+            )
+            return
+        await _stage_quality_url(
+            client,
+            message.chat.id,
+            draft,
+            link,
+            raw_url,
+            short=command == "shorturl",
+        )
+        return
+
+    if command == "qlabel":
+        args = message.command[1:] if message.command else []
+        link = None
+        raw_label = ""
+        selected = (
+            _find_episode_link(draft.episode, draft.selected_link_id)
+            if draft.selected_link_id is not None
+            else None
+        )
+        if len(args) >= 2:
+            link = _match_quality_for_draft(draft, args[0])
+            if link is not None:
+                raw_label = " ".join(args[1:]).strip()
+            elif selected is not None:
+                link = selected
+                raw_label = " ".join(args).strip()
+            else:
+                await send_message(
+                    client,
+                    message.chat.id,
+                    f"❌ No quality labelled <b>{html.escape(args[0])}</b> "
+                    "exists for this episode.",
+                )
+                return
+        elif len(args) == 1 and selected is not None:
+            link = selected
+            raw_label = args[0].strip()
+        if link is None:
+            await send_message(
+                client,
+                message.chat.id,
+                "Usage: <code>/qlabel &lt;old_quality_label&gt; "
+                "&lt;new_quality_label&gt;</code>\n\n"
+                "Tap a quality button first to use the one-argument form.",
+            )
+            return
+        await _stage_quality_label(
+            client, message.chat.id, draft, link, raw_label
+        )
+        return
+
+    if command is not None:
+        await send_message(
+            client,
+            message.chat.id,
+            "Use /label, /url, /shorturl, /qlabel, /done or /cancel. "
+            "Send a quality file with an existing quality label as its "
+            "caption to replace a file.",
+        )
+        return
+
+    if draft.stage == "label":
+        text = getattr(message, "text", None)
+        if not text:
+            await send_message(
+                client, message.chat.id, "Send the new episode label as text."
+            )
+            return
+        await _stage_episode_label(client, message.chat.id, draft, text)
+        return
+
+    if getattr(message, "video", None) or getattr(
+        message, "document", None
+    ):
+        await _stage_quality_file(client, message, draft)
+        return
+
+    text = getattr(message, "text", None)
+    if text:
+        raw = text.strip()
+        if raw.startswith(("https://", "http://", "tg://")):
+            if draft.selected_link_id is None:
+                await send_message(
+                    client,
+                    message.chat.id,
+                    "Tap a quality button first, or use "
+                    "<code>/url &lt;quality_label&gt; &lt;new_url&gt;</code>.",
+                )
+                return
+            link = _find_episode_link(
+                draft.episode, draft.selected_link_id
+            )
+            if link is None:
+                await send_message(
+                    client,
+                    message.chat.id,
+                    "❌ That quality link no longer exists. Use /cancel and "
+                    "start again.",
+                )
+                return
+            await _stage_quality_url(
+                client,
+                message.chat.id,
+                draft,
+                link,
+                raw,
+                short=False,
+            )
+            return
+        if draft.stage == "quality":
+            await send_message(
+                client,
+                message.chat.id,
+                "Send a video/document with the quality label as its caption, "
+                "or send a URL. You can also use /url, /shorturl or /qlabel.",
+            )
+            return
+
+    await send_message(
+        client,
+        message.chat.id,
+        "Send a quality file, /label, /url, /shorturl, /qlabel, /done or "
+        "/cancel.",
+    )
+
+
+async def _restore_episode_details(
+    episode_id: int, old_label: str, old_links: list[dict]
+) -> bool:
+    """Best-effort rollback used when the live keyboard cannot be edited."""
+    try:
+        return await database.update_episode_details(
+            episode_id, old_label, old_links
+        )
+    except Exception:
+        logger.exception("Failed to roll back episode #%s", episode_id)
+        return False
+
+
+async def _apply_edit_episode(
+    client: Client, chat_id: int, draft: EditEpisodeDraft
+) -> bool:
+    """Apply staged changes, then update the live keyboard or roll back."""
+    if draft.episode is None:
+        await send_message(
+            client, chat_id, "❌ No episode is selected. Use /cancel."
+        )
+        return False
+
+    episode_id = int(draft.episode["id"])
+    series = await database.get_series(draft.series_id)
+    if series is None:
+        _editepisode_sessions.pop(draft.user_id, None)
+        await send_message(
+            client,
+            chat_id,
+            f"❌ Series <code>{draft.series_id}</code> no longer exists.",
+        )
+        return False
+
+    episode = _find_episode(series, episode_id)
+    if episode is None:
+        _editepisode_sessions.pop(draft.user_id, None)
+        await send_message(
+            client,
+            chat_id,
+            "❌ That episode no longer exists. Use /cancel.",
+        )
+        return False
+
+    draft.series = series
+    draft.episode = episode
+
+    if draft.new_label is None and not draft.link_edits:
+        await send_message(
+            client, chat_id, "ℹ️ No changes were queued. Nothing to apply."
+        )
+        return True
+
+    links_chat = await _ensure_library_config(client, chat_id)
+    if links_chat is None:
+        return False
+    links_message_id = series.get("links_channel_message_id")
+    if links_message_id is None:
+        _editepisode_sessions.pop(draft.user_id, None)
+        await send_message(
+            client,
+            chat_id,
+            "❌ This series has no stored Links Channel message ID, so the "
+            "keyboard cannot be updated.",
+        )
+        return False
+
+    old_label = str(episode.get("episode_label") or "")
+    old_links = [dict(link) for link in episode.get("links", [])]
+    old_by_id = {int(link["id"]): link for link in old_links}
+
+    missing = [
+        link_id for link_id in draft.link_edits if link_id not in old_by_id
+    ]
+    if missing:
+        await send_message(
+            client,
+            chat_id,
+            "❌ One or more selected quality links no longer exist. Use "
+            "/cancel and start again.",
+        )
+        return False
+
+    new_label: Optional[str] = None
+    if draft.new_label is not None:
+        new_label, error = _validate_episode_label(draft.new_label)
+        if error:
+            await send_message(client, chat_id, error)
+            return False
+
+    updates: list[dict] = []
+    for link_id, edit in draft.link_edits.items():
+        current = old_by_id[link_id]
+        quality_label = (
+            edit.new_quality_label
+            or str(current.get("quality_label") or "Link")
+        )
+        direct_link = str(current.get("direct_link") or "")
+        short_link = current.get("short_url")
+
+        if edit.file_message_id is not None:
+            if edit.file_chat_id is None:
+                await send_message(
+                    client,
+                    chat_id,
+                    "❌ The queued replacement file is incomplete. Send it "
+                    "again.",
+                )
+                return False
+            try:
+                stored = await store_message(
+                    client,
+                    edit.file_chat_id,
+                    edit.file_message_id,
+                    uploaded_by=draft.user_id,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Failed to store replacement file for episode #%s",
+                    episode_id,
+                )
+                await send_message(
+                    client,
+                    chat_id,
+                    f"❌ Could not copy the replacement file for "
+                    f"<b>{html.escape(edit.quality_label)}</b>: "
+                    f"{html.escape(str(exc) or type(exc).__name__)}\n\n"
+                    "Nothing was changed. Check STORAGE_CHANNEL and try "
+                    "/done again.",
+                )
+                return False
+            if stored is None:
+                await send_message(
+                    client,
+                    chat_id,
+                    f"❌ Could not copy the replacement file for "
+                    f"<b>{html.escape(edit.quality_label)}</b> to "
+                    "STORAGE_CHANNEL. Check the bot's storage admin rights "
+                    "and try /done again.",
+                )
+                return False
+            direct_link = stored.direct_link
+            short_link = stored.short_link
+            # Keep the stored links staged so a retry after a Telegram edit
+            # failure does not copy the file twice.
+            edit.file_chat_id = None
+            edit.file_message_id = None
+            edit.file_type = None
+            edit.direct_link = stored.direct_link
+            edit.short_link = stored.short_link
+            edit.short_link_set = True
+
+        if edit.direct_link:
+            direct_link = edit.direct_link
+        if edit.short_link_set:
+            short_link = edit.short_link
+        if not direct_link:
+            await send_message(
+                client,
+                chat_id,
+                f"❌ The quality <b>{html.escape(quality_label)}</b> has no "
+                "direct link. Send a replacement URL or file.",
+            )
+            return False
+
+        updates.append(
+            {
+                "id": link_id,
+                "quality_label": quality_label,
+                "short_url": short_link,
+                "direct_link": direct_link,
+            }
+        )
+
+    try:
+        updated = await database.update_episode_details(
+            episode_id,
+            new_label if new_label is not None else old_label,
+            updates,
+        )
+    except Exception as exc:
+        logger.exception("Failed to update episode #%s", episode_id)
+        await send_message(
+            client,
+            chat_id,
+            "❌ <b>Episode update failed.</b>\n\n"
+            f"{html.escape(str(exc) or type(exc).__name__)}\n\n"
+            "The database was not changed.",
+        )
+        return False
+    if not updated:
+        await send_message(
+            client,
+            chat_id,
+            "❌ The episode disappeared before it could be updated.",
+        )
+        return False
+
+    try:
+        refreshed = await database.get_series(draft.series_id)
+    except Exception as exc:
+        logger.exception(
+            "Failed to reload series #%s after editing episode #%s",
+            draft.series_id,
+            episode_id,
+        )
+        restored = await _restore_episode_details(
+            episode_id, old_label, old_links
+        )
+        if restored:
+            await send_message(
+                client,
+                chat_id,
+                "❌ <b>Could not reload the updated series.</b>\n\n"
+                f"{html.escape(str(exc) or type(exc).__name__)}\n\n"
+                "The database change was rolled back so the live keyboard "
+                "and Turso still match.",
+            )
+        else:
+            _editepisode_sessions.pop(draft.user_id, None)
+            await send_message(
+                client,
+                chat_id,
+                "❌ <b>Could not reload the updated series and the database "
+                "rollback also failed.</b>\n\n"
+                "The database and the live keyboard may be out of sync. "
+                "Inspect the episode and repair it manually.",
+            )
+        return False
+    if refreshed is None:
+        _editepisode_sessions.pop(draft.user_id, None)
+        await send_message(
+            client,
+            chat_id,
+            "❌ The series disappeared after the database update. The Links "
+            "Channel message could not be updated; manual repair is needed.",
+        )
+        return False
+
+    try:
+        keyboard = _series_links_keyboard(refreshed)
+        edited = await edit_message_reply_markup(
+            client,
+            links_chat.id,
+            int(links_message_id),
+            keyboard,
+        )
+    except Exception:
+        logger.exception("Failed to edit the series Links Channel message")
+        edited = None
+
+    if edited is None:
+        restored = await _restore_episode_details(
+            episode_id, old_label, old_links
+        )
+        if restored:
+            await send_message(
+                client,
+                chat_id,
+                "❌ <b>Telegram rejected the Links Channel edit.</b>\n\n"
+                "The database change was rolled back, so the live keyboard "
+                "and Turso still match.\n\n"
+                "Check the bot's admin rights and the message, then use "
+                "/done to retry or /cancel.",
+            )
+        else:
+            _editepisode_sessions.pop(draft.user_id, None)
+            await send_message(
+                client,
+                chat_id,
+                "❌ <b>Telegram rejected the Links Channel edit and the "
+                "database rollback also failed.</b>\n\n"
+                "The database and the live keyboard may be out of sync. "
+                "Inspect the episode and repair it manually.",
+            )
+        return False
+
+    lines = [
+        f"✅ <b>Episode updated in series #{draft.series_id}</b>",
+        "",
+    ]
+    if new_label is not None:
+        lines.append(
+            f"🏷 Label: <b>{html.escape(old_label or '(empty)')}</b> → "
+            f"<b>{html.escape(new_label)}</b>"
+        )
+    else:
+        lines.append(f"🎞 Episode: <b>{html.escape(old_label)}</b>")
+
+    for update in updates:
+        current = old_by_id[int(update["id"])]
+        parts: list[str] = []
+        if update["quality_label"] != current.get("quality_label"):
+            parts.append(
+                f"label → {html.escape(str(update['quality_label']))}"
+            )
+        if update["direct_link"] != current.get("direct_link"):
+            parts.append(
+                f"direct → {html.escape(_clip(str(update['direct_link'])))}"
+            )
+        if update["short_url"] != current.get("short_url"):
+            parts.append(
+                "short → "
+                + html.escape(_clip(str(update["short_url"] or "(cleared)")))
+            )
+        if parts:
+            lines.append(
+                f"🔗 <b>{html.escape(str(current.get('quality_label') or 'Link'))}"
+                f"</b>: " + " · ".join(parts)
+            )
+
+    links_link = _message_link(links_chat, int(links_message_id))
+    if links_link:
+        lines.append(f"\n🔗 {html.escape(links_link)}")
+    lines.append("\nThe Links Channel keyboard was updated.")
+    await send_message(
+        client, chat_id, "\n".join(lines), disable_web_page_preview=True
+    )
+    logger.info(
+        "Updated episode #%s in series #%s for admin %s",
+        episode_id,
+        draft.series_id,
+        draft.user_id,
+    )
+    return True
+
+
+async def _finish_edit_episode(
+    client: Client, chat_id: int, draft: EditEpisodeDraft
+) -> None:
+    success = await _apply_edit_episode(client, chat_id, draft)
+    if success:
+        current = _editepisode_sessions.get(draft.user_id)
+        if current is draft:
+            _editepisode_sessions.pop(draft.user_id, None)
+
+
+async def handle_edit_episode_callback(
+    client: Client, query: CallbackQuery
+) -> None:
+    """Handle /editepisode inline buttons."""
+    data = query.data or ""
+    if not data.startswith("edep:"):
+        return
+    if query.from_user is None:
+        await query.answer()
+        return
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id if query.message else user_id
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    try:
+        if action == "pick" and len(parts) == 4:
+            series_id = int(parts[2])
+            episode_id = int(parts[3])
+            draft = _editepisode_sessions.get(user_id)
+            if draft is None or draft.series_id != series_id:
+                await query.answer(
+                    "This edit session is no longer active.",
+                    show_alert=True,
+                )
+                return
+            series = await database.get_series(series_id)
+            if series is None:
+                _editepisode_sessions.pop(user_id, None)
+                await query.answer(
+                    "That series no longer exists.", show_alert=True
+                )
+                return
+            episode = _find_episode(series, episode_id)
+            if episode is None:
+                await query.answer(
+                    "That episode no longer exists.", show_alert=True
+                )
+                return
+            draft.series = series
+            draft.episode = episode
+            draft.stage = "menu"
+            draft.selected_link_id = None
+            await query.answer("Episode selected")
+            if query.message is not None:
+                await _delete_status(client, chat_id, query.message)
+            await _send_edit_episode_menu(client, chat_id, draft)
+            return
+
+        if action in {
+            "rename",
+            "label",
+            "quality",
+            "done",
+            "apply",
+            "cancel",
+        } and len(parts) == 4:
+            series_id = int(parts[2])
+            episode_id = int(parts[3])
+            draft = _editepisode_sessions.get(user_id)
+            if (
+                draft is None
+                or draft.series_id != series_id
+                or draft.episode is None
+                or int(draft.episode["id"]) != episode_id
+            ):
+                await query.answer(
+                    "This edit session is no longer active.",
+                    show_alert=True,
+                )
+                return
+
+            if action in {"rename", "label"}:
+                draft.stage = "label"
+                await query.answer()
+                await send_message(
+                    client,
+                    chat_id,
+                    "✏️ Send the new episode label as text (single line, max "
+                    f"{MAX_LABEL_LENGTH} characters), or use /cancel.",
+                )
+                return
+
+            if action == "quality":
+                await query.answer()
+                await _send_edit_episode_quality_picker(
+                    client, chat_id, draft
+                )
+                return
+
+            if action in {"done", "apply"}:
+                await query.answer("Applying changes...")
+                await _finish_edit_episode(client, chat_id, draft)
+                return
+
+            _editepisode_sessions.pop(user_id, None)
+            await query.answer("Cancelled")
+            await send_message(client, chat_id, "Edit cancelled.")
+            return
+
+        if action == "q" and len(parts) == 5:
+            series_id = int(parts[2])
+            episode_id = int(parts[3])
+            link_id = int(parts[4])
+            draft = _editepisode_sessions.get(user_id)
+            if (
+                draft is None
+                or draft.series_id != series_id
+                or draft.episode is None
+                or int(draft.episode["id"]) != episode_id
+            ):
+                await query.answer(
+                    "This edit session is no longer active.",
+                    show_alert=True,
+                )
+                return
+            link = _find_episode_link(draft.episode, link_id)
+            if link is None:
+                await query.answer(
+                    "That quality link no longer exists.", show_alert=True
+                )
+                return
+            draft.selected_link_id = link_id
+            draft.stage = "quality"
+            await query.answer(
+                f"Selected {link.get('quality_label') or 'quality'}"
+            )
+            await _send_edit_episode_quality_prompt(
+                client, chat_id, draft, link
+            )
+            return
+    except (ValueError, IndexError):
+        await query.answer("Invalid edit action.", show_alert=True)
+        return
+
+    await query.answer("Invalid edit action.", show_alert=True)
 
 
 async def _handle_series_message(
@@ -2139,7 +3476,8 @@ async def _finish_newseries(
         f"{html.escape(links_post.link)}\n\n"
         f"📚 <b>Library channel post:</b>\n"
         f"{html.escape(library_post.link)}\n\n"
-        "Use /addepisode to append more episodes."
+        "Use /addepisode to append more episodes or /editepisode to fix an "
+        "existing episode."
     )
     if any(stored.short_link is None for stored in stored_files):
         text += (
@@ -2674,7 +4012,11 @@ async def _send_migration_label_confirm(
         )
         return
 
-    label = draft.episode_label or _default_label_from_post(draft.post)
+    label = _migration_episode_label(
+        draft.episode_label,
+        series,
+        customized=draft.episode_label_customized,
+    )
     draft.episode_label = label
     draft.stage = "label_confirm"
     qualities = ", ".join(
@@ -2872,7 +4214,11 @@ async def _migration_append(
         await query.answer("That series no longer exists.", show_alert=True)
         return
 
-    label = draft.episode_label or _default_label_from_post(post)
+    label = _migration_episode_label(
+        draft.episode_label,
+        series,
+        customized=draft.episode_label_customized,
+    )
     extra = len(post["qualities"])
     if int(series.get("link_count") or 0) + extra > MAX_LINKS_BUTTONS:
         await query.answer("Button limit reached.", show_alert=True)
@@ -3134,8 +4480,15 @@ async def handle_migration_callback(
                     show_alert=True,
                 )
                 return
+            series = await database.get_series(series_id)
+            if series is None:
+                await query.answer(
+                    "That series no longer exists.", show_alert=True
+                )
+                return
             draft.series_id = series_id
-            draft.episode_label = _default_label_from_post(draft.post)
+            draft.episode_label = _next_episode_label(series)
+            draft.episode_label_customized = False
             await query.answer("Series selected")
             if query.message is not None:
                 await _delete_status(client, chat_id, query.message)
@@ -3218,6 +4571,7 @@ async def _handle_migrate_message(
         return
 
     draft.episode_label = label
+    draft.episode_label_customized = True
     await _send_migration_label_confirm(client, message.chat.id, draft)
 
 
@@ -3732,6 +5086,13 @@ def register(app: Client) -> None:
     )
     app.add_handler(
         MessageHandler(
+            handle_editepisode,
+            ADMIN_PRIVATE & filters.command("editepisode"),
+        ),
+        group=-2,
+    )
+    app.add_handler(
+        MessageHandler(
             handle_migrateposts,
             ADMIN_PRIVATE & filters.command("migrateposts"),
         ),
@@ -3774,4 +5135,8 @@ def register(app: Client) -> None:
     app.add_handler(
         CallbackQueryHandler(handle_deletepost_callback, ADMIN_CALLBACK),
         group=-5,
+    )
+    app.add_handler(
+        CallbackQueryHandler(handle_edit_episode_callback, ADMIN_CALLBACK),
+        group=-6,
     )
